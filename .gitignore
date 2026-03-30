@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.local
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+_temp_inbox/
+.playwright-mcp/
+uv.lock
+.claude/
