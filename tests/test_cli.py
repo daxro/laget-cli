@@ -182,7 +182,8 @@ class TestStatusCommand:
         mock_dotenv.return_value = {}
 
         with patch("sys.argv", ["laget", "-q", "status", "--json"]):
-            main()
+            with pytest.raises(SystemExit, match="2"):
+                main()
 
         output = json.loads(capsys.readouterr().out)
         assert output["configured"] is False
@@ -192,7 +193,8 @@ class TestStatusCommand:
         mock_dotenv.return_value = {}
 
         with patch("sys.argv", ["laget", "-q", "status"]):
-            main()
+            with pytest.raises(SystemExit, match="2"):
+                main()
 
         out = capsys.readouterr().out
         assert "Not configured" in out

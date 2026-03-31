@@ -2,6 +2,10 @@
 
 An unofficial CLI for [laget.se](https://www.laget.se).
 
+For humans - stop checking the laget.se web UI. laget-cli gives you `--help` on every command, structured JSON output, and date filtering.
+
+For AI agents - every response is JSON to stdout, errors are JSON to stderr with distinct exit codes. Pass `-q` to suppress progress messages.
+
 ## Prerequisites
 
 - Python 3.10+
@@ -9,13 +13,11 @@ An unofficial CLI for [laget.se](https://www.laget.se).
 
 ## Install
 
-Global install (available everywhere):
-
 ```bash
 uv tool install git+https://github.com/daxro/laget-cli.git
 ```
 
-For development:
+**Development install:**
 
 ```bash
 git clone https://github.com/daxro/laget-cli.git
@@ -26,38 +28,19 @@ uv run laget --version
 
 ## Setup
 
-Interactive:
-
 ```bash
 laget setup
 ```
 
 Prompts for email and password, authenticates, and optionally sets a club filter to limit which teams appear.
 
-Non-interactive (for agents/CI):
+Non-interactive (pass credentials via env vars):
 
 ```bash
 EMAIL=you@example.com PASSWORD=secret laget setup --no-input
 ```
 
-## Configuration
-
-Config and state are stored in platform-standard directories (via [platformdirs](https://pypi.org/project/platformdirs/)):
-
-| File | Linux | macOS |
-|------|-------|-------|
-| Config | `~/.config/laget/config.env` | `~/Library/Application Support/laget/config.env` |
-| Session | `~/.local/state/laget/session.json` | `~/Library/Application Support/laget/session.json` |
-| State | `~/.local/state/laget/state.json` | `~/Library/Application Support/laget/state.json` |
-
-Run `laget status --json` to see the actual paths on your system.
-
-Optional config variables in `config.env`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLUB` | (none) | Case-insensitive substring filter for team club names |
-| `DEFAULT_SINCE_DAYS` | `30` | Rolling window for `--since` default |
+For agents: do not run `laget setup` without `--no-input` - the interactive prompts require stdin. If a command fails with exit code 2 and `"not_configured"` error, ask the user for their email and password, then run `EMAIL=<email> PASSWORD=<password> laget setup --no-input -q`.
 
 ## Usage
 
@@ -77,13 +60,49 @@ laget reset                                   # remove config, session, and stat
 
 All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
 
+For agents: pipe through `jq` for field extraction, e.g. `laget notifications -q | jq '.[].type'`. Use `laget status --json -q | jq '.configured'` to verify setup.
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| -q / --quiet | Suppress progress messages on stderr |
+| --no-input | Skip interactive prompts (setup only) |
+| --fields x,y | Filter JSON output to specific fields (e.g. --fields date,type,title) |
+| --debug | Log HTTP requests to stderr |
+| --since DATE | Start date (YYYY-MM-DD or 'all'). Notifications default: 30 days ago. Calendar default: today |
+| --until DATE | End date (YYYY-MM-DD or 'all'). Notifications default: no limit. Calendar default: 30 days from today |
+| --team SLUG | Filter by team slug (case-insensitive substring match). For news/event, ambiguous matches use the first result |
+| --limit N | Maximum number of results to return |
+| --version | Show version and exit |
+| --json | Output as JSON (status only) |
+
+## Configuration
+
+Config and state are stored in platform-standard directories (via [platformdirs](https://pypi.org/project/platformdirs/)):
+
+| File | Linux | macOS |
+|------|-------|-------|
+| Config | `~/.config/laget/config.env` | `~/Library/Application Support/laget/config.env` |
+| Session | `~/.local/state/laget/session.json` | `~/Library/Application Support/laget/session.json` |
+| State | `~/.local/state/laget/state.json` | `~/Library/Application Support/laget/state.json` |
+
+Run `laget status --json` to see the actual paths on your system.
+
+Optional config variables in `config.env`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLUB` | (none) | Case-insensitive substring filter for team club names |
+| `DEFAULT_SINCE_DAYS` | `30` | Rolling window for notifications `--since` default (calendar uses today as default) |
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
 | 1 | General error |
-| 2 | Invalid input |
+| 2 | Invalid input / not configured |
 | 3 | Authentication error |
 | 4 | Resource not found |
 | 5 | Network error |
@@ -93,6 +112,8 @@ Errors are emitted as JSON to stderr:
 ```json
 {"error": "auth_failed", "message": "Login failed. Check your credentials."}
 ```
+
+For agents: sessions expire and the CLI re-authenticates automatically on the next command. If a command fails with exit code 3, credentials may be wrong - tell the user to re-run `laget setup`.
 
 ## Output
 

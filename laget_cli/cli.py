@@ -78,7 +78,7 @@ def _get_session(quiet=False):
     email = config.get("EMAIL")
     password = config.get("PASSWORD")
     if not email or not password:
-        emit_error("not_configured", "Credentials not set. Run: laget setup", exit_code=EXIT_AUTH)
+        emit_error("not_configured", "Credentials not set. Run: laget setup", exit_code=EXIT_USAGE)
     _progress("Authenticating...", quiet)
     session = login(email, password, session_path=str(SESSION_FILE))
     _sync_state(session, config, quiet)
@@ -193,8 +193,10 @@ def _status(args):
     status = _get_status()
     if getattr(args, "json_output", False):
         _output_json(status, args)
-        return
-    _print_status(status)
+    else:
+        _print_status(status)
+    if not status["configured"]:
+        sys.exit(EXIT_USAGE)
 
 
 def _setup(args):
@@ -568,23 +570,30 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages on stderr")
     parser.add_argument("--no-input", action="store_true", help="Never prompt for input (fail if input would be needed)")
     parser.add_argument("--debug", action="store_true", help="Log HTTP requests and responses to stderr")
-    parser.add_argument("--fields", help="Comma-separated list of fields to include in output")
+    parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output (e.g. --fields date,type,title)")
     # Parent parser so global flags are accepted after the subcommand name too.
-    # SUPPRESS prevents subparser defaults from clobbering root-parsed values,
-    # and keeps these flags out of per-subcommand --help output.
+    # SUPPRESS on defaults prevents subparser defaults from clobbering root-parsed values.
     _global_flags = argparse.ArgumentParser(add_help=False)
     _global_flags.add_argument("-q", "--quiet", action="store_true",
-                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+                               default=argparse.SUPPRESS, help="Suppress progress messages on stderr")
     _global_flags.add_argument("--no-input", action="store_true",
-                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+                               default=argparse.SUPPRESS, help="Never prompt for input (fail if input would be needed)")
     _global_flags.add_argument("--debug", action="store_true",
-                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+                               default=argparse.SUPPRESS, help="Log HTTP requests and responses to stderr")
     _global_flags.add_argument("--fields",
-                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+                               default=argparse.SUPPRESS, help="Comma-separated list of fields to include in JSON output (e.g. --fields date,type,title)")
 
     subparsers = parser.add_subparsers(dest="command", title="commands", parser_class=_LagetParser)
-    setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter",
-                                         parents=[_global_flags])
+    setup_parser = subparsers.add_parser(
+        "setup", help="Configure credentials and club filter",
+        parents=[_global_flags],
+        epilog="""non-interactive mode:
+  EMAIL=you@example.com PASSWORD=secret laget setup --no-input
+
+  Reads credentials from EMAIL and PASSWORD environment variables.
+  Useful for CI pipelines and AI agent tool-use environments.""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children",
                                           parents=[_global_flags])
     status_parser.add_argument("--json", dest="json_output", action="store_true", help="Output status as JSON to stdout")
@@ -594,8 +603,8 @@ def main():
         parents=[_global_flags],
     )
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
-    notif_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: 30 days ago)")
-    notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
+    notif_parser.add_argument("--since", help="Start date YYYY-MM-DD or 'all' (default: 30 days ago)")
+    notif_parser.add_argument("--until", help="End date YYYY-MM-DD or 'all' (default: no limit)")
     notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments",
@@ -606,8 +615,8 @@ def main():
     cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams",
                                        parents=[_global_flags])
     cal_parser.add_argument("--team", help="Filter by team slug (substring match)")
-    cal_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: today)")
-    cal_parser.add_argument("--until", help="End date YYYY-MM-DD (default: 30 days from today)")
+    cal_parser.add_argument("--since", help="Start date YYYY-MM-DD or 'all' (default: today)")
+    cal_parser.add_argument("--until", help="End date YYYY-MM-DD or 'all' (default: 30 days from today)")
     cal_parser.add_argument("--limit", type=int, help="Maximum number of events per team to return")
 
     event_parser = subparsers.add_parser("event", help="Fetch event detail",
