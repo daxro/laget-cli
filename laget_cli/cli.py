@@ -26,6 +26,32 @@ from laget_cli.api.notifications import resolve_team_names
 from laget_cli.paths import CONFIG_DIR, CONFIG_FILE, SESSION_FILE, STATE_DIR, STATE_FILE
 from laget_cli.session import login
 
+try:
+    import argcomplete
+    _HAS_ARGCOMPLETE = True
+except ImportError:
+    _HAS_ARGCOMPLETE = False
+
+
+class _LagetParser(argparse.ArgumentParser):
+    """ArgumentParser that emits JSON errors to stderr."""
+
+    def error(self, message):
+        error = {"error": "usage_error", "message": message}
+        print(json.dumps(error), file=sys.stderr)
+        self.exit(EXIT_USAGE)
+
+
+def _configure_debug():
+    """Enable debug logging of HTTP requests to stderr."""
+    import logging
+    logging.basicConfig(
+        format="%(levelname)s %(name)s: %(message)s",
+        level=logging.DEBUG,
+        stream=sys.stderr,
+    )
+    logging.getLogger("urllib3").setLevel(logging.DEBUG)
+
 
 def _progress(message, quiet=False):
     """Print progress message to stderr unless quiet mode is enabled."""
@@ -160,10 +186,10 @@ def _print_status(status):
 
 def _status(args):
     status = _get_status()
-    if getattr(args, "human_output", False):
-        _print_status(status)
+    if getattr(args, "json_output", False):
+        _output_json(status, args)
         return
-    print(json.dumps(_filter_fields(status, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
+    _print_status(status)
 
 
 def _setup(args):
@@ -298,6 +324,13 @@ def _filter_fields(data, fields_str):
     return data
 
 
+def _output_json(data, args):
+    """Print data as JSON to stdout, applying --fields filter if set."""
+    fields_str = getattr(args, "fields", None)
+    data = _filter_fields(data, fields_str)
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
 def _filter_items_since(items, since, date_key="date"):
     """Filter items where item[date_key] >= since. None = no filter."""
     if since is None:
@@ -351,7 +384,7 @@ def _notifications(args):
     if limit is not None:
         notifications = notifications[:limit]
 
-    print(json.dumps(_filter_fields(notifications, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
+    _output_json(notifications, args)
 
 
 def _news(args):
@@ -368,7 +401,7 @@ def _news(args):
     article["team"] = team_name
     article["team_slug"] = team_slug
 
-    print(json.dumps(_filter_fields(article, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
+    _output_json(article, args)
 
 
 def _resolve_team_slug(args_team, teams):
@@ -390,6 +423,7 @@ def _resolve_team_slug(args_team, teams):
 def _calendar(args):
     config = dotenv_values(CONFIG_FILE)
     team_filter = getattr(args, "team", None)
+    limit = getattr(args, "limit", None)
 
     today = date.today()
 
@@ -426,6 +460,8 @@ def _calendar(args):
         events = fetch_calendar_range(session, team["team_slug"], since, until)
         events = _filter_items_since(events, since)
         events = _filter_items_until(events, until)
+        if limit is not None:
+            events = events[:limit]
         if not events:
             continue
         output.append({
@@ -434,12 +470,7 @@ def _calendar(args):
             "events": events,
         })
 
-    fields_str = getattr(args, "fields", None)
-    if fields_str:
-        fields = {f.strip() for f in fields_str.split(",")}
-        for entry in output:
-            entry["events"] = [{k: v for k, v in e.items() if k in fields} for e in entry["events"]]
-    print(json.dumps(output, ensure_ascii=False, indent=2))
+    _output_json(output, args)
 
 
 def _event(args):
@@ -455,7 +486,7 @@ def _event(args):
     detail = fetch_event_detail(session, team_slug, args.id)
     detail["team"] = team_name
 
-    print(json.dumps(_filter_fields(detail, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
+    _output_json(detail, args)
 
 
 _LOGO_LINES = [
@@ -494,18 +525,26 @@ def print_logo():
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = _LagetParser(
         prog="laget",
         description="Fetch data from laget.se - teams, notifications, calendar, and more.",
+        epilog="""examples:
+  laget notifications                   Activity from last 30 days
+  laget notifications --team tigers     Filter by team
+  laget calendar --since 2026-01-01     Events since a date
+  laget news --team tigers 12345        News article detail
+  laget event --team tigers 67890       Event with RSVP details""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_pkg_version('laget-cli')}")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages on stderr")
-    subparsers = parser.add_subparsers(dest="command", title="commands")
+    parser.add_argument("--no-input", action="store_true", help="Never prompt for input (fail if input would be needed)")
+    parser.add_argument("--debug", action="store_true", help="Log HTTP requests and responses to stderr")
+    parser.add_argument("--fields", help="Comma-separated list of fields to include in output")
+    subparsers = parser.add_subparsers(dest="command", title="commands", parser_class=_LagetParser)
     setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter")
-    setup_parser.add_argument("--no-input", dest="no_input", action="store_true", help="Non-interactive mode (requires EMAIL and PASSWORD env vars)")
     status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children")
-    status_parser.add_argument("--human", dest="human_output", action="store_true", help="Print human-readable status to stderr instead of JSON")
-    status_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
+    status_parser.add_argument("--json", dest="json_output", action="store_true", help="Output status as JSON to stdout")
 
     notif_parser = subparsers.add_parser(
         "notifications", help="Show recent activity feed across teams"
@@ -514,25 +553,28 @@ def main():
     notif_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: 30 days ago)")
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
     notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
-    notif_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments")
     news_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     news_parser.add_argument("id", help="Article ID")
-    news_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams")
     cal_parser.add_argument("--team", help="Filter by team slug (substring match)")
     cal_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: today)")
     cal_parser.add_argument("--until", help="End date YYYY-MM-DD (default: 30 days from today)")
-    cal_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output (applied to events)")
+    cal_parser.add_argument("--limit", type=int, help="Maximum number of events per team to return")
 
     event_parser = subparsers.add_parser("event", help="Fetch event detail")
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
-    event_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
+
+    if _HAS_ARGCOMPLETE:
+        argcomplete.autocomplete(parser)
 
     args = parser.parse_args()
+
+    if getattr(args, "debug", False):
+        _configure_debug()
 
     if args.command is None:
         print_logo()

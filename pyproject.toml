@@ -12,6 +12,9 @@ dependencies = [
     "platformdirs>=4.0.0",
 ]
 
+[project.optional-dependencies]
+completion = ["argcomplete>=3.0"]
+
 [project.scripts]
 laget = "laget_cli.cli:main"
 
