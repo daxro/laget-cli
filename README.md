@@ -1,6 +1,6 @@
 # laget-cli
 
-CLI that fetches sports team data from [laget.se](https://www.laget.se). Outputs JSON to stdout.
+An unofficial CLI for [laget.se](https://www.laget.se).
 
 ## Prerequisites
 
@@ -42,13 +42,15 @@ EMAIL=you@example.com PASSWORD=secret laget setup --no-input
 
 ## Configuration
 
-Config and state are stored in XDG-standard directories:
+Config and state are stored in platform-standard directories (via [platformdirs](https://pypi.org/project/platformdirs/)):
 
-| File | Path | Contents |
-|------|------|----------|
-| Config | `~/.config/laget/config.env` | `EMAIL`, `PASSWORD`, `CLUB`, `DEFAULT_SINCE_DAYS` |
-| Session | `~/.local/state/laget/session.json` | Cached auth cookies |
-| State | `~/.local/state/laget/state.json` | Cached child-team mapping |
+| File | Linux | macOS |
+|------|-------|-------|
+| Config | `~/.config/laget/config.env` | `~/Library/Application Support/laget/config.env` |
+| Session | `~/.local/state/laget/session.json` | `~/Library/Application Support/laget/session.json` |
+| State | `~/.local/state/laget/state.json` | `~/Library/Application Support/laget/state.json` |
+
+Run `laget status --json` to see the actual paths on your system.
 
 Optional config variables in `config.env`:
 
@@ -160,7 +162,7 @@ Notification types: `news`, `news_comment`, `guestbook`, `rsvp`, `unknown`.
 
 ```bash
 laget reset -q                             # remove config, session, and state
-pip uninstall laget-cli                    # remove the binary
+uv tool uninstall laget-cli                # remove the binary
 ```
 
 ## Testing

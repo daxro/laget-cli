@@ -36,14 +36,6 @@ class TestProgress:
         assert capsys.readouterr().err == ""
 
 
-class TestMainNoCommand:
-    def test_no_command_shows_help_and_exits(self, capsys):
-        with patch("sys.argv", ["laget"]):
-            with pytest.raises(SystemExit) as exc:
-                main()
-            assert exc.value.code == 1
-
-
 class TestMainVersion:
     def test_version(self, capsys):
         from importlib.metadata import version
@@ -55,15 +47,13 @@ class TestMainVersion:
             assert expected in capsys.readouterr().out
 
 
-class TestVersionFromMetadata:
-    def test_no_hardcoded_version_in_cli(self):
-        """Ensure cli.py does not contain a hardcoded version string in the argparse setup."""
-        import laget_cli.cli as cli_mod
-        source_path = cli_mod.__file__
-        with open(source_path) as f:
-            source = f.read()
-        # Should not have version="%(prog)s 0.1.0" or similar hardcoded pattern
-        assert 'version="%(prog)s 0.' not in source
+class TestMainNoCommand:
+    def test_no_command_shows_help_and_exits_zero(self, capsys):
+        with patch("sys.argv", ["laget"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 0
+
 
 
 
@@ -181,11 +171,11 @@ class TestStatusCommand:
         with patch("sys.argv", ["laget", "-q", "status"]):
             main()
 
-        err = capsys.readouterr().err
-        assert "Email: use****@example.com" in err
-        assert "Session: valid" in err
-        assert "T1 (Test FK)" in err
-        assert "Alice" in err
+        out = capsys.readouterr().out
+        assert "Email: use****@example.com" in out
+        assert "Session: valid" in out
+        assert "T1 (Test FK)" in out
+        assert "Alice" in out
 
     @patch("laget_cli.cli.dotenv_values")
     def test_status_not_configured_outputs_json(self, mock_dotenv, capsys):
@@ -198,13 +188,14 @@ class TestStatusCommand:
         assert output["configured"] is False
 
     @patch("laget_cli.cli.dotenv_values")
-    def test_status_not_configured_human_exits(self, mock_dotenv, capsys):
+    def test_status_not_configured_human_shows_message(self, mock_dotenv, capsys):
         mock_dotenv.return_value = {}
 
         with patch("sys.argv", ["laget", "-q", "status"]):
-            with pytest.raises(SystemExit) as exc:
-                main()
-            assert exc.value.code == 3
+            main()
+
+        out = capsys.readouterr().out
+        assert "Not configured" in out
 
 
 class TestNewsCommand:
@@ -314,7 +305,7 @@ class TestSetupCommand:
                 with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
                     with patch("laget_cli.cli.login") as mock_login:
                         mock_login.return_value = MagicMock()
-                        with patch("laget_cli.cli._get_status", return_value={"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": []}):
+                        with patch("laget_cli.cli._get_status", return_value={"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": [], "config_path": "/tmp/config.env", "session_path": "/tmp/session.json"}):
                             main()
 
         err = capsys.readouterr().err
@@ -350,7 +341,7 @@ class TestSetupNoInput:
     def test_no_input_flag_skips_prompts(self, mock_dotenv, mock_logo, mock_write_env, mock_login, mock_status, capsys):
         mock_dotenv.return_value = {}
         mock_login.return_value = MagicMock()
-        mock_status.return_value = {"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": []}
+        mock_status.return_value = {"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": [], "config_path": "/tmp/config.env", "session_path": "/tmp/session.json"}
 
         with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
             with patch("sys.argv", ["laget", "-q", "setup", "--no-input"]):

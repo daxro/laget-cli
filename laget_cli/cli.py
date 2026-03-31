@@ -131,6 +131,8 @@ def _get_status():
         "session": None,
         "teams": [],
         "children": [],
+        "config_path": str(CONFIG_FILE),
+        "session_path": str(SESSION_FILE),
     }
 
     if status["configured"]:
@@ -161,28 +163,30 @@ def _get_status():
 
 
 def _print_status(status):
-    """Print human-readable status to stderr."""
+    """Print human-readable status to stdout."""
     if not status["configured"]:
-        emit_error("not_configured", "Not configured. Run: laget setup", exit_code=EXIT_AUTH)
+        print("Not configured. Run: laget setup")
+        return
 
-    print(f"Email: {status['email']}", file=sys.stderr)
+    print(f"Email: {status['email']}")
     if status["club_filter"]:
-        print(f"Club: {status['club_filter']}", file=sys.stderr)
-    print(f"Session: {status['session']}", file=sys.stderr)
+        print(f"Club: {status['club_filter']}")
+    print(f"Config: {status['config_path']}")
+    print(f"Session: {status['session']}")
     if status["session"] == "expired":
-        print("  Run any command to re-authenticate.", file=sys.stderr)
+        print("  Run any command to re-authenticate.")
     if status["teams"]:
-        print("Teams:", file=sys.stderr)
+        print("Teams:")
         for team in status["teams"]:
-            print(f"  - {team['name']} ({team['club']})", file=sys.stderr)
+            print(f"  - {team['name']} ({team['club']})")
     if status["children"]:
-        print("Children:", file=sys.stderr)
+        print("Children:")
         for child in status["children"]:
             team = child.get("team_name")
             if team:
-                print(f"  - {child['name']} -> {team}", file=sys.stderr)
+                print(f"  - {child['name']} -> {team}")
             else:
-                print(f"  - {child['name']}", file=sys.stderr)
+                print(f"  - {child['name']}")
 
 
 def _status(args):
@@ -624,7 +628,7 @@ def main():
     if args.command is None:
         print_logo()
         parser.print_help()
-        sys.exit(1)
+        sys.exit(0)
 
     try:
         if args.command == "setup":
