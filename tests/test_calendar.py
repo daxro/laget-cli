@@ -686,18 +686,18 @@ class TestEventCommand:
                 return json.loads(out.getvalue())
 
     def test_outputs_event_dict(self):
-        result = self._run(["event", "TeamAlpha-P2021", "29705518"])
+        result = self._run(["event", "--team", "TeamAlpha-P2021", "29705518"])
         assert isinstance(result, dict)
         assert result["location"] == "Sjöängsskolan"
 
     def test_team_name_resolved(self):
-        result = self._run(["event", "TeamAlpha-P2021", "29705518"])
+        result = self._run(["event", "--team", "TeamAlpha-P2021", "29705518"])
         assert result["team"] == "P2021"
 
     def test_unknown_team_exits(self):
         with pytest.raises(SystemExit):
-            self._run(["event", "NoSuchTeam", "12345"])
+            self._run(["event", "--team", "NoSuchTeam", "12345"])
 
     def test_team_substring_match(self):
-        result = self._run(["event", "TeamAlpha", "29705518"])
+        result = self._run(["event", "--team", "TeamAlpha", "29705518"])
         assert result["team"] == "P2021"

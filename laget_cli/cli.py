@@ -113,8 +113,8 @@ def _get_status():
                 teams = fetch_teams(session)
                 teams = filter_teams_by_club(teams, club_filter)
                 status["teams"] = teams
-            except Exception:
-                pass
+            except (requests.RequestException, ParseError) as e:
+                print(f"Warning: could not fetch teams: {e}", file=sys.stderr)
             try:
                 children = fetch_children(session)
                 state = _load_state()
@@ -124,8 +124,8 @@ def _get_status():
                     child["team_slug"] = ct["team_slug"] if ct else None
                     child["team_name"] = ct["team_name"] if ct else None
                 status["children"] = children
-            except Exception:
-                pass
+            except (requests.RequestException, ParseError, KeyError) as e:
+                print(f"Warning: could not fetch children: {e}", file=sys.stderr)
         except SystemExit:
             status["session"] = "expired"
 
@@ -159,15 +159,15 @@ def _print_status(status):
 
 def _status(args):
     status = _get_status()
-    if getattr(args, "json_output", False):
-        print(json.dumps(status, ensure_ascii=False, indent=2))
+    if getattr(args, "human_output", False):
+        _print_status(status)
         return
-    _print_status(status)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
 
 
 def _setup(args):
     print_logo()
-    if not sys.stdin.isatty():
+    if getattr(args, "no_input", False) or not sys.stdin.isatty():
         email = os.environ.get("EMAIL")
         password = os.environ.get("PASSWORD")
         if not email or not password:
@@ -472,9 +472,10 @@ def main():
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages on stderr")
     subparsers = parser.add_subparsers(dest="command", title="commands")
-    subparsers.add_parser("setup", help="Configure credentials and club filter")
+    setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter")
+    setup_parser.add_argument("--no-input", dest="no_input", action="store_true", help="Non-interactive mode (requires EMAIL and PASSWORD env vars)")
     status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children")
-    status_parser.add_argument("--json", dest="json_output", action="store_true", help="Output status as JSON to stdout")
+    status_parser.add_argument("--human", dest="human_output", action="store_true", help="Print human-readable status to stderr instead of JSON")
 
     notif_parser = subparsers.add_parser(
         "notifications", help="Show recent activity feed across teams"
@@ -484,7 +485,7 @@ def main():
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments")
-    news_parser.add_argument("team", help="Team slug (or substring)")
+    news_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     news_parser.add_argument("id", help="Article ID")
 
     cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams")
@@ -493,7 +494,7 @@ def main():
     cal_parser.add_argument("--until", help="End date YYYY-MM-DD (default: 30 days from today)")
 
     event_parser = subparsers.add_parser("event", help="Fetch event detail")
-    event_parser.add_argument("team", help="Team slug (or substring)")
+    event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
 
     args = parser.parse_args()

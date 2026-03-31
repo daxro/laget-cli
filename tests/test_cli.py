@@ -65,7 +65,7 @@ class TestStatusCommand:
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
         mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
 
-        with patch("sys.argv", ["laget", "-q", "status", "--json"]):
+        with patch("sys.argv", ["laget", "-q", "status"]):
             main()
 
         output = json.loads(capsys.readouterr().out)
@@ -85,7 +85,7 @@ class TestStatusCommand:
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
         mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
 
-        with patch("sys.argv", ["laget", "-q", "status"]):
+        with patch("sys.argv", ["laget", "-q", "status", "--human"]):
             main()
 
         err = capsys.readouterr().err
@@ -95,13 +95,41 @@ class TestStatusCommand:
         assert "Alice" in err
 
     @patch("laget_cli.cli.dotenv_values")
-    def test_status_not_configured(self, mock_dotenv, capsys):
+    def test_status_not_configured_outputs_json(self, mock_dotenv, capsys):
         mock_dotenv.return_value = {}
 
         with patch("sys.argv", ["laget", "-q", "status"]):
+            main()
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["configured"] is False
+
+    @patch("laget_cli.cli.dotenv_values")
+    def test_status_not_configured_human_exits(self, mock_dotenv, capsys):
+        mock_dotenv.return_value = {}
+
+        with patch("sys.argv", ["laget", "-q", "status", "--human"]):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 3
+
+
+class TestStatusDefaultsToJson:
+    @patch("laget_cli.cli.fetch_children")
+    @patch("laget_cli.cli.fetch_teams")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_status_outputs_json_by_default(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, capsys):
+        mock_dotenv.return_value = {"EMAIL": "user@example.com", "PASSWORD": "pass", "CLUB": "Test FK"}
+        mock_login.return_value = MagicMock()
+        mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
+        mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
+
+        with patch("sys.argv", ["laget", "-q", "status"]):
+            main()
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["configured"] is True
 
 
 class TestNewsCommand:
@@ -127,7 +155,7 @@ class TestNewsCommand:
             "team_slug": None,
         }
 
-        with patch("sys.argv", ["laget", "-q", "news", "TeamA-P2021", "123"]):
+        with patch("sys.argv", ["laget", "-q", "news", "--team", "TeamA-P2021", "123"]):
             main()
 
         output = json.loads(capsys.readouterr().out)
@@ -145,10 +173,61 @@ class TestNewsCommand:
         mock_filter.return_value = [{"team_slug": "TeamA-P2021", "name": "P2021", "club": "A"}]
         mock_fetch_teams.return_value = mock_filter.return_value
 
-        with patch("sys.argv", ["laget", "-q", "news", "nonexistent", "123"]):
+        with patch("sys.argv", ["laget", "-q", "news", "--team", "nonexistent", "123"]):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 4
+
+
+
+class TestNewsTeamFlag:
+    @patch("laget_cli.cli.fetch_article")
+    @patch("laget_cli.cli.filter_teams_by_club")
+    @patch("laget_cli.cli.fetch_teams")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_news_accepts_team_flag(self, mock_dotenv, mock_login, mock_fetch_teams, mock_filter, mock_fetch_article, capsys):
+        mock_dotenv.return_value = {"EMAIL": "t@t.com", "PASSWORD": "p"}
+        mock_login.return_value = MagicMock()
+        mock_filter.return_value = [{"team_slug": "TeamA-P2021", "name": "P2021", "club": "A"}]
+        mock_fetch_teams.return_value = mock_filter.return_value
+        mock_fetch_article.return_value = {
+            "id": "123", "title": "Test", "author": "A", "date": "2026-03-28T00:00:00",
+            "body": "Body", "view_count": 10, "comments": [], "team": None, "team_slug": None,
+        }
+
+        with patch("sys.argv", ["laget", "-q", "news", "--team", "TeamA-P2021", "123"]):
+            main()
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["id"] == "123"
+        assert output["team"] == "P2021"
+
+
+class TestEventTeamFlag:
+    @patch("laget_cli.cli.fetch_event_detail")
+    @patch("laget_cli.cli.filter_teams_by_club")
+    @patch("laget_cli.cli.fetch_teams")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_event_accepts_team_flag(self, mock_dotenv, mock_login, mock_fetch_teams, mock_filter, mock_fetch_detail, capsys):
+        mock_dotenv.return_value = {"EMAIL": "t@t.com", "PASSWORD": "p"}
+        mock_login.return_value = MagicMock()
+        mock_filter.return_value = [{"team_slug": "TeamA-P2021", "name": "P2021", "club": "A"}]
+        mock_fetch_teams.return_value = mock_filter.return_value
+        mock_fetch_detail.return_value = {
+            "id": "29705518", "team": None, "team_slug": "TeamA-P2021",
+            "type": None, "title": None, "cancelled": False, "date": None,
+            "start_time": None, "end_time": None, "assembly_time": None,
+            "location": "Somewhere", "location_url": None, "notes": None,
+            "rsvp": None, "responses": [],
+        }
+
+        with patch("sys.argv", ["laget", "-q", "event", "--team", "TeamA-P2021", "29705518"]):
+            main()
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["team"] == "P2021"
 
 
 class TestPrintLogo:
@@ -235,6 +314,69 @@ class TestSignalHandling:
                         main()
         err = capsys.readouterr().err
         assert "Traceback" not in err
+
+
+class TestSetupNoInput:
+    @patch("laget_cli.cli._get_status")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli._write_env")
+    @patch("laget_cli.cli.print_logo")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_no_input_flag_skips_prompts(self, mock_dotenv, mock_logo, mock_write_env, mock_login, mock_status, capsys):
+        mock_dotenv.return_value = {}
+        mock_login.return_value = MagicMock()
+        mock_status.return_value = {"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": []}
+
+        with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
+            with patch("sys.argv", ["laget", "-q", "setup", "--no-input"]):
+                # stdin IS a tty, but --no-input should override
+                with patch("sys.stdin") as mock_stdin:
+                    mock_stdin.isatty.return_value = True
+                    main()
+
+        mock_write_env.assert_called_once_with("t@t.com", "pw")
+
+    @patch("laget_cli.cli.print_logo")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_no_input_flag_errors_without_env_vars(self, mock_dotenv, mock_logo, capsys):
+        mock_dotenv.return_value = {}
+
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("EMAIL", None)
+            os.environ.pop("PASSWORD", None)
+            with patch("sys.argv", ["laget", "setup", "--no-input"]):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 2
+
+
+
+class TestGetStatusExceptionHandling:
+    @patch("laget_cli.cli._load_state", return_value={})
+    @patch("laget_cli.cli.fetch_children", side_effect=requests.ConnectionError("network down"))
+    @patch("laget_cli.cli.fetch_teams", return_value=[{"name": "T1", "club": "C", "team_slug": "a"}])
+    @patch("laget_cli.cli.filter_teams_by_club", return_value=[{"name": "T1", "club": "C", "team_slug": "a"}])
+    @patch("laget_cli.cli.login", return_value=MagicMock())
+    @patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"})
+    def test_children_fetch_failure_warns_on_stderr(self, mock_dotenv, mock_login, mock_filter, mock_teams, mock_children, mock_state, capsys):
+        from laget_cli.cli import _get_status
+        status = _get_status()
+        err = capsys.readouterr().err
+        assert "Warning" in err or "warning" in err
+        assert status["children"] == []
+
+    @patch("laget_cli.cli.fetch_children", return_value=[])
+    @patch("laget_cli.cli.fetch_teams", side_effect=requests.Timeout("timed out"))
+    @patch("laget_cli.cli.filter_teams_by_club", return_value=[])
+    @patch("laget_cli.cli.login", return_value=MagicMock())
+    @patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"})
+    def test_teams_fetch_failure_warns_on_stderr(self, mock_dotenv, mock_login, mock_filter, mock_teams, mock_children, capsys):
+        from laget_cli.cli import _get_status
+        status = _get_status()
+        err = capsys.readouterr().err
+        assert "Warning" in err or "warning" in err
+        assert status["teams"] == []
+
 
 
 class TestErrorHandling:
