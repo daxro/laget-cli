@@ -52,11 +52,11 @@ This applies whenever a command fails with exit code 2 and `"not_configured"` er
 ```bash
 laget status                                  # human-readable status
 laget status --json                           # machine-readable status
-laget calendar                                # upcoming events (next 30 days)
+laget calendar                                # upcoming events (default: next 30 days)
 laget calendar --since 2026-04-01 --until 2026-04-30
 laget calendar --team P2019 --limit 5         # filter by team, cap results
 laget event --team P2019 12345                # event detail with RSVP
-laget notifications                           # activity feed (last 30 days)
+laget notifications                           # activity feed (default: last 30 days)
 laget notifications --since all               # all notifications, no date limit
 laget notifications --team Knatte --limit 10  # filter by team, cap results
 laget news --team P2019 67890                 # full article with comments
