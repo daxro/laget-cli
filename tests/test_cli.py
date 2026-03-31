@@ -105,6 +105,59 @@ class TestFieldsFlag:
         assert set(result[0].keys()) == {"date", "type"}
 
 
+class TestNotificationsLimit:
+    def _run_notifications(self, argv, notifications_data, teams_data=None):
+        from io import StringIO
+        if teams_data is None:
+            teams_data = [{"team_slug": "TeamAlpha-P2021", "name": "P2021", "club": "FK"}]
+
+        with patch("laget_cli.cli._get_session") as mock_session, \
+             patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
+             patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
+             patch("laget_cli.cli.fetch_notifications", return_value=notifications_data), \
+             patch("laget_cli.cli.resolve_team_names", side_effect=lambda n, t: n), \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
+            mock_session.return_value = MagicMock()
+            with patch("sys.argv", ["laget"] + argv):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    main()
+                return json.loads(out.getvalue())
+
+    def test_limit_truncates_results(self):
+        notifications = [
+            {"date": f"2026-03-{i:02d}T00:00:00", "type": "news", "author": "A",
+             "title": "t", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/News/1"}
+            for i in range(1, 11)
+        ]
+        result = self._run_notifications(["notifications", "--since", "all", "--limit", "3"], notifications)
+        assert len(result) == 3
+
+    def test_no_limit_returns_all(self):
+        notifications = [
+            {"date": f"2026-03-{i:02d}T00:00:00", "type": "news", "author": "A",
+             "title": "t", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/News/1"}
+            for i in range(1, 6)
+        ]
+        result = self._run_notifications(["notifications", "--since", "all"], notifications)
+        assert len(result) == 5
+
+    def test_limit_applied_after_sort(self):
+        notifications = [
+            {"date": "2026-03-01T00:00:00", "type": "news", "author": "A",
+             "title": "old", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/News/1"},
+            {"date": "2026-03-29T00:00:00", "type": "news", "author": "B",
+             "title": "new", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/News/2"},
+            {"date": "2026-03-15T00:00:00", "type": "news", "author": "C",
+             "title": "mid", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/News/3"},
+        ]
+        result = self._run_notifications(["notifications", "--since", "all", "--limit", "2"], notifications)
+        assert len(result) == 2
+        # Should be the 2 newest (sorted desc)
+        assert result[0]["date"] == "2026-03-29T00:00:00"
+        assert result[1]["date"] == "2026-03-15T00:00:00"
+
+
 class TestStatusCommand:
     @patch("laget_cli.cli.fetch_children")
     @patch("laget_cli.cli.fetch_teams")

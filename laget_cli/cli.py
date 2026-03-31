@@ -347,6 +347,10 @@ def _notifications(args):
     # Sort by date descending (newest first); items with no date go last
     notifications.sort(key=lambda n: n["date"] or "", reverse=True)
 
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        notifications = notifications[:limit]
+
     print(json.dumps(_filter_fields(notifications, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
 
 
@@ -492,6 +496,7 @@ def main():
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
     notif_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: 30 days ago)")
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
+    notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
     notif_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments")
