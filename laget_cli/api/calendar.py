@@ -36,13 +36,14 @@ def fetch_calendar_range(session, team_slug, start_date, end_date):
     Args:
         session: authenticated requests.Session
         team_slug: team URL slug
-        start_date: ISO date string "YYYY-MM-DD"
-        end_date: ISO date string "YYYY-MM-DD"
+        start_date: ISO date string "YYYY-MM-DD" or None (defaults to 1 year ago)
+        end_date: ISO date string "YYYY-MM-DD" or None (defaults to 1 year from now)
 
     Returns a deduplicated, sorted list of event dicts.
     """
-    start = date.fromisoformat(start_date)
-    end = date.fromisoformat(end_date)
+    today = date.today()
+    start = date.fromisoformat(start_date) if start_date else today.replace(year=today.year - 1)
+    end = date.fromisoformat(end_date) if end_date else today.replace(year=today.year + 1)
 
     # Build list of (year, month) pairs to fetch
     months = []
