@@ -541,30 +541,49 @@ def main():
     parser.add_argument("--no-input", action="store_true", help="Never prompt for input (fail if input would be needed)")
     parser.add_argument("--debug", action="store_true", help="Log HTTP requests and responses to stderr")
     parser.add_argument("--fields", help="Comma-separated list of fields to include in output")
+    # Parent parser so global flags are accepted after the subcommand name too.
+    # SUPPRESS prevents subparser defaults from clobbering root-parsed values,
+    # and keeps these flags out of per-subcommand --help output.
+    _global_flags = argparse.ArgumentParser(add_help=False)
+    _global_flags.add_argument("-q", "--quiet", action="store_true",
+                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    _global_flags.add_argument("--no-input", action="store_true",
+                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    _global_flags.add_argument("--debug", action="store_true",
+                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    _global_flags.add_argument("--fields",
+                               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
     subparsers = parser.add_subparsers(dest="command", title="commands", parser_class=_LagetParser)
-    setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter")
-    status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children")
+    setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter",
+                                         parents=[_global_flags])
+    status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children",
+                                          parents=[_global_flags])
     status_parser.add_argument("--json", dest="json_output", action="store_true", help="Output status as JSON to stdout")
 
     notif_parser = subparsers.add_parser(
-        "notifications", help="Show recent activity feed across teams"
+        "notifications", help="Show recent activity feed across teams",
+        parents=[_global_flags],
     )
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
     notif_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: 30 days ago)")
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
     notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
 
-    news_parser = subparsers.add_parser("news", help="Fetch a news article with comments")
+    news_parser = subparsers.add_parser("news", help="Fetch a news article with comments",
+                                        parents=[_global_flags])
     news_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     news_parser.add_argument("id", help="Article ID")
 
-    cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams")
+    cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams",
+                                       parents=[_global_flags])
     cal_parser.add_argument("--team", help="Filter by team slug (substring match)")
     cal_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: today)")
     cal_parser.add_argument("--until", help="End date YYYY-MM-DD (default: 30 days from today)")
     cal_parser.add_argument("--limit", type=int, help="Maximum number of events per team to return")
 
-    event_parser = subparsers.add_parser("event", help="Fetch event detail")
+    event_parser = subparsers.add_parser("event", help="Fetch event detail",
+                                         parents=[_global_flags])
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
 
