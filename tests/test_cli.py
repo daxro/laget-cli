@@ -78,6 +78,33 @@ class TestVersionFromMetadata:
 
 
 
+class TestFieldsFlag:
+    def test_notifications_fields_filters_output(self):
+        from io import StringIO
+
+        notifications = [
+            {"date": "2026-03-29T00:00:00", "type": "news", "author": "A",
+             "title": "t", "team": "T1", "team_slug": "A", "url": "/x/News/1"},
+        ]
+        teams = [{"team_slug": "A", "name": "A", "club": "C"}]
+
+        with patch("laget_cli.cli._get_session") as mock_session, \
+             patch("laget_cli.cli.fetch_teams", return_value=teams), \
+             patch("laget_cli.cli.filter_teams_by_club", return_value=teams), \
+             patch("laget_cli.cli.fetch_notifications", return_value=notifications), \
+             patch("laget_cli.cli.resolve_team_names", side_effect=lambda n, t: n), \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"}):
+            mock_session.return_value = MagicMock()
+            with patch("sys.argv", ["laget", "-q", "notifications", "--since", "all", "--fields", "date,type"]):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    main()
+
+        result = json.loads(out.getvalue())
+        assert len(result) == 1
+        assert set(result[0].keys()) == {"date", "type"}
+
+
 class TestStatusCommand:
     @patch("laget_cli.cli.fetch_children")
     @patch("laget_cli.cli.fetch_teams")
