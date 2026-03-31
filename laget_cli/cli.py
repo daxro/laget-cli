@@ -442,11 +442,26 @@ _RESET = "\033[0m"
 _SPLIT = 27
 
 
+def _use_color():
+    """Return True if stderr supports ANSI color."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    if not hasattr(sys.stderr, "isatty") or not sys.stderr.isatty():
+        return False
+    return True
+
+
 def print_logo():
+    color = _use_color()
     for line in _LOGO_LINES:
         main_part = line[:_SPLIT]
         cli_part = line[_SPLIT:] if len(line) > _SPLIT else ""
-        print(f"{_CYAN}{main_part}{_RESET}{_BOLD_WHITE}{cli_part}{_RESET}", file=sys.stderr)
+        if color:
+            print(f"{_CYAN}{main_part}{_RESET}{_BOLD_WHITE}{cli_part}{_RESET}", file=sys.stderr)
+        else:
+            print(f"{main_part}{cli_part}", file=sys.stderr)
 
 
 def main():

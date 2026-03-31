@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from laget_cli.cli import _mask_email, _progress, main, print_logo
+from laget_cli.cli import _mask_email, _progress, _use_color, main, print_logo
 
 
 class TestMaskEmail:
@@ -149,6 +149,52 @@ class TestNewsCommand:
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 4
+
+
+class TestPrintLogo:
+    def test_use_color_true_on_tty(self):
+        mock_stderr = MagicMock()
+        mock_stderr.isatty.return_value = True
+        env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "TERM")}
+        with patch("sys.stderr", mock_stderr):
+            with patch.dict("os.environ", env, clear=True):
+                result = _use_color()
+        assert result is True
+
+    def test_logo_has_ansi_on_tty(self):
+        import io
+        buf = io.StringIO()
+        mock_stderr = MagicMock()
+        mock_stderr.isatty.return_value = True
+        mock_stderr.write = buf.write
+        mock_stderr.flush = buf.flush
+        env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "TERM")}
+        with patch("sys.stderr", mock_stderr):
+            with patch.dict("os.environ", env, clear=True):
+                print_logo()
+        assert "\033[" in buf.getvalue()
+
+    def test_logo_no_ansi_when_no_color_set(self, capsys):
+        with patch.dict("os.environ", {"NO_COLOR": "1"}):
+            print_logo()
+        err = capsys.readouterr().err
+        assert "\033[" not in err
+        assert "|___/" in err
+
+    def test_logo_no_ansi_when_term_dumb(self, capsys):
+        with patch.dict("os.environ", {"TERM": "dumb"}):
+            print_logo()
+        err = capsys.readouterr().err
+        assert "\033[" not in err
+
+    def test_logo_no_ansi_when_not_tty(self, capsys):
+        with patch("sys.stderr") as mock_stderr:
+            mock_stderr.isatty.return_value = False
+            mock_stderr.write = sys.stderr.write
+            mock_stderr.flush = sys.stderr.flush
+            print_logo()
+        err = capsys.readouterr().err
+        assert "\033[" not in err
 
 
 class TestSetupCommand:
