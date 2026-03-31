@@ -46,11 +46,35 @@ class TestMainNoCommand:
 
 class TestMainVersion:
     def test_version(self, capsys):
+        from importlib.metadata import version
+        expected = version("laget-cli")
         with patch("sys.argv", ["laget", "--version"]):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 0
-            assert "0.1.0" in capsys.readouterr().out
+            assert expected in capsys.readouterr().out
+
+
+class TestVersionFromMetadata:
+    def test_version_matches_pyproject(self, capsys):
+        from importlib.metadata import version
+        expected = version("laget-cli")
+
+        with patch("sys.argv", ["laget", "--version"]):
+            with pytest.raises(SystemExit):
+                main()
+
+        out = capsys.readouterr().out
+        assert expected in out
+
+    def test_no_hardcoded_version_in_cli(self):
+        """Ensure cli.py does not contain a hardcoded version string in the argparse setup."""
+        import laget_cli.cli as cli_mod
+        source_path = cli_mod.__file__
+        with open(source_path) as f:
+            source = f.read()
+        # Should not have version="%(prog)s 0.1.0" or similar hardcoded pattern
+        assert 'version="%(prog)s 0.' not in source
 
 
 

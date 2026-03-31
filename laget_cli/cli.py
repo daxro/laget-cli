@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from datetime import date, timedelta
+from importlib.metadata import version as _pkg_version
 
 import requests
 from dotenv import dotenv_values
@@ -454,7 +455,7 @@ def main():
         prog="laget",
         description="Fetch data from laget.se - teams, notifications, calendar, and more.",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_pkg_version('laget-cli')}")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages on stderr")
     subparsers = parser.add_subparsers(dest="command", title="commands")
     subparsers.add_parser("setup", help="Configure credentials and club filter")
