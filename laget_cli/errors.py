@@ -13,10 +13,6 @@ class AuthError(Exception):
     """Login failed, session expired, or credentials missing."""
 
 
-class NetworkError(Exception):
-    """Connection or timeout error."""
-
-
 class ParseError(Exception):
     """Unexpected HTML structure from a web endpoint."""
 

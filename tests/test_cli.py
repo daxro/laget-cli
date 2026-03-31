@@ -158,7 +158,7 @@ class TestStatusCommand:
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
         mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
 
-        with patch("sys.argv", ["laget", "-q", "status"]):
+        with patch("sys.argv", ["laget", "-q", "status", "--json"]):
             main()
 
         output = json.loads(capsys.readouterr().out)
@@ -178,7 +178,7 @@ class TestStatusCommand:
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
         mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
 
-        with patch("sys.argv", ["laget", "-q", "status", "--human"]):
+        with patch("sys.argv", ["laget", "-q", "status"]):
             main()
 
         err = capsys.readouterr().err
@@ -191,7 +191,7 @@ class TestStatusCommand:
     def test_status_not_configured_outputs_json(self, mock_dotenv, capsys):
         mock_dotenv.return_value = {}
 
-        with patch("sys.argv", ["laget", "-q", "status"]):
+        with patch("sys.argv", ["laget", "-q", "status", "--json"]):
             main()
 
         output = json.loads(capsys.readouterr().out)
@@ -201,7 +201,7 @@ class TestStatusCommand:
     def test_status_not_configured_human_exits(self, mock_dotenv, capsys):
         mock_dotenv.return_value = {}
 
-        with patch("sys.argv", ["laget", "-q", "status", "--human"]):
+        with patch("sys.argv", ["laget", "-q", "status"]):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 3

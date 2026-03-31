@@ -48,6 +48,7 @@ Config and state are stored in XDG-standard directories:
 |------|------|----------|
 | Config | `~/.config/laget/config.env` | `EMAIL`, `PASSWORD`, `CLUB`, `DEFAULT_SINCE_DAYS` |
 | Session | `~/.local/state/laget/session.json` | Cached auth cookies |
+| State | `~/.local/state/laget/state.json` | Cached child-team mapping |
 
 Optional config variables in `config.env`:
 
@@ -71,7 +72,7 @@ laget notifications --team Knatte --limit 10  # filter by team, cap results
 laget news --team P2019 67890                 # full article with comments
 ```
 
-All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--debug` to log HTTP traffic.
+All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
 
 ## Exit Codes
 

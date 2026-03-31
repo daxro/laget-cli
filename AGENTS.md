@@ -46,6 +46,7 @@ Errors are JSON on stderr with distinct exit codes:
 | Exit code | Meaning |
 |-----------|---------|
 | 0 | Success |
+| 1 | General error |
 | 2 | Invalid input / usage error |
 | 3 | Authentication error |
 | 4 | Resource not found |

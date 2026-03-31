@@ -40,4 +40,3 @@ laget.se uses a standard form login: GET login page for CSRF token, POST credent
 - Config: `~/.config/laget/config.env` (EMAIL, PASSWORD, optional CLUB filter)
 - Session cache: `~/.local/state/laget/session.json`
 - State cache: `~/.local/state/laget/state.json` (child-team mapping, synced on auth)
-- State cache: `~/.local/state/laget/state.json` (child-team mapping)
