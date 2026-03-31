@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from laget_cli.cli import _mask_email, _progress, main
+from laget_cli.cli import _mask_email, _progress, main, print_logo
 
 
 class TestMaskEmail:
@@ -149,6 +149,27 @@ class TestNewsCommand:
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 4
+
+
+class TestSetupCommand:
+    @patch("laget_cli.cli.dotenv_values")
+    def test_setup_calls_print_logo(self, mock_dotenv, capsys):
+        """setup command should call print_logo(), not reference _LOGO."""
+        mock_dotenv.return_value = {}
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = False
+        with patch("sys.argv", ["laget", "setup"]):
+            with patch("sys.stdin", mock_stdin):
+                with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
+                    with patch("laget_cli.cli.login") as mock_login:
+                        mock_login.return_value = MagicMock()
+                        with patch("laget_cli.cli._get_status", return_value={"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": []}):
+                            main()
+
+        err = capsys.readouterr().err
+        # Should contain the logo ASCII art, not crash with NameError
+        assert "___ _" in err or "laget" in err or "|___/" in err
 
 
 class TestErrorHandling:

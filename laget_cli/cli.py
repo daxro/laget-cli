@@ -166,7 +166,7 @@ def _status(args):
 
 
 def _setup(args):
-    print(_LOGO, file=sys.stderr, end="")
+    print_logo()
     if not sys.stdin.isatty():
         email = os.environ.get("EMAIL")
         password = os.environ.get("PASSWORD")
