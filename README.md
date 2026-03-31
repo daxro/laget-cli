@@ -37,7 +37,7 @@ Prompts for email and password, authenticates, and optionally sets a club filter
 Non-interactive (for agents/CI):
 
 ```bash
-EMAIL=you@example.com PASSWORD=secret laget setup
+EMAIL=you@example.com PASSWORD=secret laget setup --no-input
 ```
 
 ## Configuration
@@ -59,18 +59,19 @@ Optional config variables in `config.env`:
 ## Usage
 
 ```bash
-laget status                                  # config, session, teams, children
+laget status                                  # human-readable status
+laget status --json                           # machine-readable status
 laget calendar                                # upcoming events (next 30 days)
 laget calendar --since 2026-04-01 --until 2026-04-30
-laget calendar --team P2019                   # filter by team
-laget event <team-slug> <event-id>            # event detail with RSVP
+laget calendar --team P2019 --limit 5         # filter by team, cap results
+laget event --team P2019 12345                # event detail with RSVP
 laget notifications                           # activity feed (last 30 days)
 laget notifications --since all               # all notifications, no date limit
-laget notifications --team Knatte             # filter by team
-laget news <team-slug> <article-id>           # full article with comments
+laget notifications --team Knatte --limit 10  # filter by team, cap results
+laget news --team P2019 67890                 # full article with comments
 ```
 
-All commands output JSON to stdout. Progress messages go to stderr. Use `-q` / `--quiet` to suppress progress.
+All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--debug` to log HTTP traffic.
 
 ## Exit Codes
 
@@ -91,7 +92,7 @@ Errors are emitted as JSON to stderr:
 
 ## Output
 
-Status:
+Status (`laget status --json`):
 
 ```json
 {
