@@ -516,6 +516,8 @@ def main():
             _calendar(args)
         elif args.command == "event":
             _event(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
     except AuthError as e:
         emit_error("auth_failed", str(e), exit_code=EXIT_AUTH)
     except ParseError as e:

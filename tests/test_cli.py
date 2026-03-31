@@ -218,6 +218,25 @@ class TestSetupCommand:
         assert "___ _" in err or "laget" in err or "|___/" in err
 
 
+class TestSignalHandling:
+    def test_keyboard_interrupt_exits_130(self):
+        with patch("sys.argv", ["laget", "notifications"]):
+            with patch("laget_cli.cli._notifications", side_effect=KeyboardInterrupt):
+                with patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"}):
+                    with pytest.raises(SystemExit) as exc:
+                        main()
+                    assert exc.value.code == 130
+
+    def test_keyboard_interrupt_no_traceback(self, capsys):
+        with patch("sys.argv", ["laget", "notifications"]):
+            with patch("laget_cli.cli._notifications", side_effect=KeyboardInterrupt):
+                with patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"}):
+                    with pytest.raises(SystemExit):
+                        main()
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+
+
 class TestErrorHandling:
     @patch("laget_cli.cli.login")
     @patch("laget_cli.cli.dotenv_values")
