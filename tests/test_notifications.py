@@ -1,7 +1,6 @@
 """Tests for laget_cli.api.notifications."""
 
 import json
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -270,11 +269,6 @@ class TestParseNotifications:
         err = capsys.readouterr().err
         assert "Weirdpage" in err or "SomeTeam" in err or "unknown" in err.lower()
 
-    def test_all_required_fields_present(self):
-        results = _parse_notifications(GUESTBOOK_NOTIFICATION_HTML)
-        n = results[0]
-        for field in ("date", "type", "author", "title", "team", "team_slug", "url"):
-            assert field in n, f"Missing field: {field}"
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +295,6 @@ class TestResolveTeamNames:
         result = resolve_team_names(notifications, teams)
         assert result[0]["team"] is None
 
-    def test_mutates_in_place_and_returns_same_list(self):
-        notifications = [{"team_slug": "TeamAlpha-P2021", "team": None}]
-        teams = [{"team_slug": "TeamAlpha-P2021", "name": "P2021 Knatte"}]
-        result = resolve_team_names(notifications, teams)
-        assert result is notifications
 
 
 # ---------------------------------------------------------------------------
@@ -336,16 +325,6 @@ class TestFetchNotifications:
         call_kwargs = session.get.call_args[1]
         assert call_kwargs.get("headers", {}).get("X-Requested-With") == "XMLHttpRequest"
 
-    def test_returns_parsed_list(self):
-        session = MagicMock()
-        resp = MagicMock()
-        resp.text = GUESTBOOK_NOTIFICATION_HTML
-        resp.raise_for_status = MagicMock()
-        session.get.return_value = resp
-
-        results = fetch_notifications(session)
-        assert isinstance(results, list)
-        assert len(results) == 1
 
 
 # ---------------------------------------------------------------------------

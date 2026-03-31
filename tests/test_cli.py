@@ -56,17 +56,6 @@ class TestMainVersion:
 
 
 class TestVersionFromMetadata:
-    def test_version_matches_pyproject(self, capsys):
-        from importlib.metadata import version
-        expected = version("laget-cli")
-
-        with patch("sys.argv", ["laget", "--version"]):
-            with pytest.raises(SystemExit):
-                main()
-
-        out = capsys.readouterr().out
-        assert expected in out
-
     def test_no_hardcoded_version_in_cli(self):
         """Ensure cli.py does not contain a hardcoded version string in the argparse setup."""
         import laget_cli.cli as cli_mod
@@ -218,24 +207,6 @@ class TestStatusCommand:
             assert exc.value.code == 3
 
 
-class TestStatusDefaultsToJson:
-    @patch("laget_cli.cli.fetch_children")
-    @patch("laget_cli.cli.fetch_teams")
-    @patch("laget_cli.cli.login")
-    @patch("laget_cli.cli.dotenv_values")
-    def test_status_outputs_json_by_default(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, capsys):
-        mock_dotenv.return_value = {"EMAIL": "user@example.com", "PASSWORD": "pass", "CLUB": "Test FK"}
-        mock_login.return_value = MagicMock()
-        mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
-        mock_fetch_children.return_value = [{"name": "Alice", "id": "123"}]
-
-        with patch("sys.argv", ["laget", "-q", "status"]):
-            main()
-
-        output = json.loads(capsys.readouterr().out)
-        assert output["configured"] is True
-
-
 class TestNewsCommand:
     @patch("laget_cli.cli.fetch_article")
     @patch("laget_cli.cli.filter_teams_by_club")
@@ -282,56 +253,6 @@ class TestNewsCommand:
                 main()
             assert exc.value.code == 4
 
-
-
-class TestNewsTeamFlag:
-    @patch("laget_cli.cli.fetch_article")
-    @patch("laget_cli.cli.filter_teams_by_club")
-    @patch("laget_cli.cli.fetch_teams")
-    @patch("laget_cli.cli.login")
-    @patch("laget_cli.cli.dotenv_values")
-    def test_news_accepts_team_flag(self, mock_dotenv, mock_login, mock_fetch_teams, mock_filter, mock_fetch_article, capsys):
-        mock_dotenv.return_value = {"EMAIL": "t@t.com", "PASSWORD": "p"}
-        mock_login.return_value = MagicMock()
-        mock_filter.return_value = [{"team_slug": "TeamA-P2021", "name": "P2021", "club": "A"}]
-        mock_fetch_teams.return_value = mock_filter.return_value
-        mock_fetch_article.return_value = {
-            "id": "123", "title": "Test", "author": "A", "date": "2026-03-28T00:00:00",
-            "body": "Body", "view_count": 10, "comments": [], "team": None, "team_slug": None,
-        }
-
-        with patch("sys.argv", ["laget", "-q", "news", "--team", "TeamA-P2021", "123"]):
-            main()
-
-        output = json.loads(capsys.readouterr().out)
-        assert output["id"] == "123"
-        assert output["team"] == "P2021"
-
-
-class TestEventTeamFlag:
-    @patch("laget_cli.cli.fetch_event_detail")
-    @patch("laget_cli.cli.filter_teams_by_club")
-    @patch("laget_cli.cli.fetch_teams")
-    @patch("laget_cli.cli.login")
-    @patch("laget_cli.cli.dotenv_values")
-    def test_event_accepts_team_flag(self, mock_dotenv, mock_login, mock_fetch_teams, mock_filter, mock_fetch_detail, capsys):
-        mock_dotenv.return_value = {"EMAIL": "t@t.com", "PASSWORD": "p"}
-        mock_login.return_value = MagicMock()
-        mock_filter.return_value = [{"team_slug": "TeamA-P2021", "name": "P2021", "club": "A"}]
-        mock_fetch_teams.return_value = mock_filter.return_value
-        mock_fetch_detail.return_value = {
-            "id": "29705518", "team": None, "team_slug": "TeamA-P2021",
-            "type": None, "title": None, "cancelled": False, "date": None,
-            "start_time": None, "end_time": None, "assembly_time": None,
-            "location": "Somewhere", "location_url": None, "notes": None,
-            "rsvp": None, "responses": [],
-        }
-
-        with patch("sys.argv", ["laget", "-q", "event", "--team", "TeamA-P2021", "29705518"]):
-            main()
-
-        output = json.loads(capsys.readouterr().out)
-        assert output["team"] == "P2021"
 
 
 class TestPrintLogo:

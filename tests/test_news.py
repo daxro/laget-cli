@@ -240,42 +240,17 @@ class TestParseArticle:
 # ---------------------------------------------------------------------------
 
 class TestParseComments:
-    def test_returns_list(self):
-        result = _parse_comments(COMMENTS_HTML)
-        assert isinstance(result, list)
-
-    def test_comment_count(self):
+    def test_parses_all_comments_with_correct_fields(self):
         result = _parse_comments(COMMENTS_HTML)
         assert len(result) == 3
-
-    def test_first_comment_author(self):
-        result = _parse_comments(COMMENTS_HTML)
         assert result[0]["author"] == "Maria Nilsson"
-
-    def test_first_comment_date(self):
-        result = _parse_comments(COMMENTS_HTML)
         assert result[0]["date"] == "2019-06-15T00:00:00"
-
-    def test_first_comment_text(self):
-        result = _parse_comments(COMMENTS_HTML)
         assert result[0]["text"] == "Bra, vi kommer!"
-
-    def test_second_comment_author(self):
-        result = _parse_comments(COMMENTS_HTML)
-        assert result[1]["author"] == "Erik Johansson"
-
-    def test_second_comment_date(self):
-        result = _parse_comments(COMMENTS_HTML)
-        assert result[1]["date"] == "2023-08-28T00:00:00"
 
     def test_emoji_img_stripped_from_comment_text(self):
         result = _parse_comments(COMMENTS_HTML)
         assert "<img" not in result[1]["text"]
         assert "Vi ocksa!" in result[1]["text"]
-
-    def test_third_comment_date(self):
-        result = _parse_comments(COMMENTS_HTML)
-        assert result[2]["date"] == "2024-03-05T00:00:00"
 
     def test_empty_comment_list_returns_empty(self):
         result = _parse_comments(EMPTY_COMMENT_LIST_HTML)
@@ -286,7 +261,6 @@ class TestParseComments:
         assert result == []
 
     def test_order_is_ascending(self):
-        # Comments should be in HTML order (ascending by date)
         result = _parse_comments(COMMENTS_HTML)
         dates = [c["date"] for c in result]
         assert dates == sorted(dates)

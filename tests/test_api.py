@@ -91,11 +91,6 @@ class TestParseTeams:
         assert teams[1] == {"name": "F2019", "club": "Team Beta IK", "team_slug": "TeamBeta-F2019"}
         assert teams[2] == {"name": "P2019 Väst", "club": "Team Alpha FK", "team_slug": "TeamAlpha-P2019Vast"}
 
-    def test_handles_html_entities_in_name(self):
-        teams = _parse_teams(TEAMS_HTML)
-        # V&#228;st should be decoded to Väst
-        assert teams[2]["name"] == "P2019 Väst"
-
     def test_empty_html_returns_empty_list(self):
         teams = _parse_teams(EMPTY_HTML)
         assert teams == []

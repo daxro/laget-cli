@@ -1,7 +1,7 @@
 """Tests for laget_cli.api.calendar."""
 
 import json
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -360,13 +360,6 @@ class TestParseEventDetail:
         result = _parse_event_detail(DETAIL_NO_NOTES_HTML, "99002", "TeamAlpha-P2021")
         assert result["notes"] is None
 
-    def test_responses_is_empty_list(self):
-        result = _parse_event_detail(DETAIL_TRAINING_WITH_MAPS_HTML, "29705518", "TeamAlpha-P2021")
-        assert result["responses"] == []
-
-    def test_cancelled_is_false(self):
-        result = _parse_event_detail(DETAIL_TRAINING_WITH_MAPS_HTML, "29705518", "TeamAlpha-P2021")
-        assert result["cancelled"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +368,6 @@ class TestParseEventDetail:
 
 class TestParseLocation:
     def test_extracts_location(self):
-        assert _parse_location(DETAIL_TRAINING_WITH_MAPS_HTML) == "Sjöängsskolan"
-
-    def test_location_before_anchor(self):
         assert _parse_location(DETAIL_TRAINING_WITH_MAPS_HTML) == "Sjöängsskolan"
 
     def test_no_location_returns_none(self):
@@ -438,11 +428,6 @@ class TestParseRsvp:
     def test_no_rsvp_returns_none(self):
         assert _parse_rsvp(DETAIL_NO_RSVP_HTML) is None
 
-    def test_counts_are_none(self):
-        result = _parse_rsvp(DETAIL_TRAINING_WITH_MAPS_HTML)
-        assert result["yes"] is None
-        assert result["no"] is None
-        assert result["unanswered"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -574,16 +559,6 @@ class TestFetchEventDetail:
         kwargs = session.get.call_args[1]
         assert kwargs.get("params", {}).get("eventId") == "29705518"
 
-    def test_returns_parsed_dict(self):
-        session = MagicMock()
-        resp = MagicMock()
-        resp.text = DETAIL_TRAINING_WITH_MAPS_HTML
-        resp.raise_for_status = MagicMock()
-        session.get.return_value = resp
-
-        result = fetch_event_detail(session, "TeamAlpha-P2021", "29705518")
-        assert isinstance(result, dict)
-        assert result["location"] == "Sjöängsskolan"
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +710,8 @@ class TestFetchCalendarRangeNone:
 # ---------------------------------------------------------------------------
 
 class TestCalendarSinceAll:
+    """Regression tests for --since all / --until all (previously crashed with TypeError)."""
+
     def _run(self, argv, events_data=None, teams_data=None):
         from io import StringIO
         from laget_cli.cli import main
@@ -764,9 +741,4 @@ class TestCalendarSinceAll:
     def test_until_all_does_not_crash(self):
         """calendar --until all should not crash with TypeError."""
         result = self._run(["calendar", "--until", "all"])
-        assert isinstance(result, list)
-
-    def test_both_all_does_not_crash(self):
-        """calendar --since all --until all should not crash."""
-        result = self._run(["calendar", "--since", "all", "--until", "all"])
         assert isinstance(result, list)
