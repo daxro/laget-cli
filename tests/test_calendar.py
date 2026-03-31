@@ -701,3 +701,72 @@ class TestEventCommand:
     def test_team_substring_match(self):
         result = self._run(["event", "--team", "TeamAlpha", "29705518"])
         assert result["team"] == "P2021"
+
+
+# ---------------------------------------------------------------------------
+# fetch_calendar_range with None dates
+# ---------------------------------------------------------------------------
+
+class TestFetchCalendarRangeNone:
+    def test_none_start_uses_reasonable_default(self):
+        """fetch_calendar_range with None start_date should not crash."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.text = CALENDAR_EMPTY_HTML
+        resp.raise_for_status = MagicMock()
+        session.get.return_value = resp
+
+        events = fetch_calendar_range(session, "TeamAlpha-P2021", None, "2026-04-30")
+        assert isinstance(events, list)
+
+    def test_none_end_uses_reasonable_default(self):
+        session = MagicMock()
+        resp = MagicMock()
+        resp.text = CALENDAR_EMPTY_HTML
+        resp.raise_for_status = MagicMock()
+        session.get.return_value = resp
+
+        events = fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-01", None)
+        assert isinstance(events, list)
+
+
+# ---------------------------------------------------------------------------
+# CLI handler - calendar --since all / --until all
+# ---------------------------------------------------------------------------
+
+class TestCalendarSinceAll:
+    def _run(self, argv, events_data=None, teams_data=None):
+        from io import StringIO
+        from laget_cli.cli import main
+
+        if teams_data is None:
+            teams_data = [{"team_slug": "TeamAlpha-P2021", "name": "P2021", "club": "TeamAlpha FK"}]
+        if events_data is None:
+            events_data = []
+
+        with patch("laget_cli.cli._get_session") as mock_session, \
+             patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
+             patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
+             patch("laget_cli.cli.fetch_calendar_range", return_value=events_data), \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
+            mock_session.return_value = MagicMock()
+            with patch("sys.argv", ["laget"] + argv):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    main()
+                return json.loads(out.getvalue())
+
+    def test_since_all_does_not_crash(self):
+        """calendar --since all should not crash with TypeError."""
+        result = self._run(["calendar", "--since", "all"])
+        assert isinstance(result, list)
+
+    def test_until_all_does_not_crash(self):
+        """calendar --until all should not crash with TypeError."""
+        result = self._run(["calendar", "--until", "all"])
+        assert isinstance(result, list)
+
+    def test_both_all_does_not_crash(self):
+        """calendar --since all --until all should not crash."""
+        result = self._run(["calendar", "--since", "all", "--until", "all"])
+        assert isinstance(result, list)

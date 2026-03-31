@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from datetime import date, timedelta
+from importlib.metadata import version as _pkg_version
 
 import requests
 from dotenv import dotenv_values
@@ -162,7 +163,7 @@ def _status(args):
     if getattr(args, "human_output", False):
         _print_status(status)
         return
-    print(json.dumps(status, ensure_ascii=False, indent=2))
+    print(json.dumps(_filter_fields(status, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
 
 
 def _setup(args):
@@ -278,6 +279,25 @@ def _resolve_until(cli_value):
     return None
 
 
+def _filter_fields(data, fields_str):
+    """Filter JSON output to only include specified fields.
+
+    Args:
+        data: list of dicts, or a dict
+        fields_str: comma-separated field names, or None (no filtering)
+
+    Returns filtered data (same structure, fewer keys).
+    """
+    if fields_str is None:
+        return data
+    fields = {f.strip() for f in fields_str.split(",")}
+    if isinstance(data, list):
+        return [{k: v for k, v in item.items() if k in fields} for item in data]
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if k in fields}
+    return data
+
+
 def _filter_items_since(items, since, date_key="date"):
     """Filter items where item[date_key] >= since. None = no filter."""
     if since is None:
@@ -327,7 +347,11 @@ def _notifications(args):
     # Sort by date descending (newest first); items with no date go last
     notifications.sort(key=lambda n: n["date"] or "", reverse=True)
 
-    print(json.dumps(notifications, ensure_ascii=False, indent=2))
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        notifications = notifications[:limit]
+
+    print(json.dumps(_filter_fields(notifications, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
 
 
 def _news(args):
@@ -344,7 +368,7 @@ def _news(args):
     article["team"] = team_name
     article["team_slug"] = team_slug
 
-    print(json.dumps(article, ensure_ascii=False, indent=2))
+    print(json.dumps(_filter_fields(article, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
 
 
 def _resolve_team_slug(args_team, teams):
@@ -410,6 +434,11 @@ def _calendar(args):
             "events": events,
         })
 
+    fields_str = getattr(args, "fields", None)
+    if fields_str:
+        fields = {f.strip() for f in fields_str.split(",")}
+        for entry in output:
+            entry["events"] = [{k: v for k, v in e.items() if k in fields} for e in entry["events"]]
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
@@ -426,7 +455,7 @@ def _event(args):
     detail = fetch_event_detail(session, team_slug, args.id)
     detail["team"] = team_name
 
-    print(json.dumps(detail, ensure_ascii=False, indent=2))
+    print(json.dumps(_filter_fields(detail, getattr(args, "fields", None)), ensure_ascii=False, indent=2))
 
 
 _LOGO_LINES = [
@@ -469,13 +498,14 @@ def main():
         prog="laget",
         description="Fetch data from laget.se - teams, notifications, calendar, and more.",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_pkg_version('laget-cli')}")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages on stderr")
     subparsers = parser.add_subparsers(dest="command", title="commands")
     setup_parser = subparsers.add_parser("setup", help="Configure credentials and club filter")
     setup_parser.add_argument("--no-input", dest="no_input", action="store_true", help="Non-interactive mode (requires EMAIL and PASSWORD env vars)")
     status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children")
     status_parser.add_argument("--human", dest="human_output", action="store_true", help="Print human-readable status to stderr instead of JSON")
+    status_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     notif_parser = subparsers.add_parser(
         "notifications", help="Show recent activity feed across teams"
@@ -483,19 +513,24 @@ def main():
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
     notif_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: 30 days ago)")
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD (default: no limit)")
+    notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
+    notif_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments")
     news_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     news_parser.add_argument("id", help="Article ID")
+    news_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams")
     cal_parser.add_argument("--team", help="Filter by team slug (substring match)")
     cal_parser.add_argument("--since", help="Start date YYYY-MM-DD (default: today)")
     cal_parser.add_argument("--until", help="End date YYYY-MM-DD (default: 30 days from today)")
+    cal_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output (applied to events)")
 
     event_parser = subparsers.add_parser("event", help="Fetch event detail")
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
+    event_parser.add_argument("--fields", help="Comma-separated list of fields to include in JSON output")
 
     args = parser.parse_args()
 
