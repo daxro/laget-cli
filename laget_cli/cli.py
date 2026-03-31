@@ -17,6 +17,7 @@ from laget_cli.errors import (
     ParseError,
     emit_error,
     EXIT_AUTH,
+    EXIT_ERROR,
     EXIT_NETWORK,
     EXIT_NOT_FOUND,
     EXIT_USAGE,
@@ -489,6 +490,29 @@ def _event(args):
     _output_json(detail, args)
 
 
+def _reset(args):
+    """Remove all config, session, and state files."""
+    deleted = []
+    failed = []
+    for path in [CONFIG_FILE, SESSION_FILE, STATE_FILE]:
+        if path.exists():
+            try:
+                path.unlink()
+                deleted.append(str(path))
+            except OSError as e:
+                failed.append(str(path))
+                if not args.quiet:
+                    print(f"Failed to delete {path}: {e}", file=sys.stderr)
+    if not args.quiet and deleted:
+        for p in deleted:
+            print(f"Deleted {p}", file=sys.stderr)
+    if not args.quiet and not deleted and not failed:
+        print("Nothing to reset — no config or session files found.", file=sys.stderr)
+    print(json.dumps({"reset": True, "deleted": deleted, "failed": failed}))
+    if failed:
+        sys.exit(EXIT_ERROR)
+
+
 _LOGO_LINES = [
     r" _                  _        ___ _    ___ ",
     r"| | __ _  __ _  ___| |_     / __| |  |_ _|",
@@ -587,6 +611,8 @@ def main():
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
 
+    subparsers.add_parser("reset", parents=[_global_flags], help="Remove all config, session, and state files")
+
     if _HAS_ARGCOMPLETE:
         argcomplete.autocomplete(parser)
 
@@ -613,6 +639,8 @@ def main():
             _calendar(args)
         elif args.command == "event":
             _event(args)
+        elif args.command == "reset":
+            _reset(args)
     except KeyboardInterrupt:
         sys.exit(130)
     except AuthError as e:

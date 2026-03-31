@@ -23,6 +23,7 @@ laget calendar -q                               # Upcoming events (next 30 days)
 laget calendar -q --since 2026-01-01 --limit 5  # Events since a date, limited per team
 laget news --team tigers 12345 -q               # News article with comments
 laget event --team tigers 67890 -q              # Event detail with RSVPs
+laget reset -q                                  # Remove all config and session
 ```
 
 ## Flags

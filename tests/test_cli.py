@@ -485,3 +485,100 @@ class TestErrorHandling:
 
         err = json.loads(capsys.readouterr().err)
         assert err["error"] == "connection_failed"
+
+
+class TestResetCommand:
+    def test_reset_deletes_files(self, tmp_path, capsys):
+        from laget_cli.cli import _reset
+
+        config = tmp_path / "config.env"
+        session = tmp_path / "session.json"
+        state = tmp_path / "state.json"
+        config.write_text("EMAIL=test@test.com\nPASSWORD=secret\n")
+        session.write_text("{}")
+        state.write_text("{}")
+
+        args = MagicMock()
+        args.quiet = False
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session), \
+             patch("laget_cli.cli.STATE_FILE", state):
+            _reset(args)
+
+        assert not config.exists()
+        assert not session.exists()
+        assert not state.exists()
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["reset"] is True
+        assert len(data["deleted"]) == 3
+        assert data["failed"] == []
+        assert "Deleted" in captured.err
+
+    def test_reset_already_clean(self, tmp_path, capsys):
+        from laget_cli.cli import _reset
+
+        config = tmp_path / "config.env"
+        session = tmp_path / "session.json"
+        state = tmp_path / "state.json"
+
+        args = MagicMock()
+        args.quiet = False
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session), \
+             patch("laget_cli.cli.STATE_FILE", state):
+            _reset(args)
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["reset"] is True
+        assert data["deleted"] == []
+        assert data["failed"] == []
+        assert "Nothing to reset" in captured.err
+
+    def test_reset_quiet_suppresses_stderr(self, tmp_path, capsys):
+        from laget_cli.cli import _reset
+
+        config = tmp_path / "config.env"
+        session = tmp_path / "session.json"
+        state = tmp_path / "state.json"
+        config.write_text("EMAIL=test@test.com\nPASSWORD=secret\n")
+
+        args = MagicMock()
+        args.quiet = True
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session), \
+             patch("laget_cli.cli.STATE_FILE", state):
+            _reset(args)
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        data = json.loads(captured.out)
+        assert data["reset"] is True
+
+    def test_reset_permission_error_exits_nonzero(self, tmp_path, capsys):
+        from laget_cli.cli import _reset
+
+        config = tmp_path / "config.env"
+        session = tmp_path / "session.json"
+        state = tmp_path / "state.json"
+        config.write_text("EMAIL=test@test.com\nPASSWORD=secret\n")
+
+        args = MagicMock()
+        args.quiet = False
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session), \
+             patch("laget_cli.cli.STATE_FILE", state), \
+             patch.object(type(config), "unlink", side_effect=OSError("Permission denied")):
+            with pytest.raises(SystemExit) as exc:
+                _reset(args)
+            assert exc.value.code == 1
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert len(data["failed"]) == 1
+        assert "Failed to delete" in captured.err

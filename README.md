@@ -70,6 +70,7 @@ laget notifications                           # activity feed (last 30 days)
 laget notifications --since all               # all notifications, no date limit
 laget notifications --team Knatte --limit 10  # filter by team, cap results
 laget news --team P2019 67890                 # full article with comments
+laget reset                                   # remove config, session, and state files
 ```
 
 All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
@@ -154,6 +155,13 @@ Notifications:
 ```
 
 Notification types: `news`, `news_comment`, `guestbook`, `rsvp`, `unknown`.
+
+## Uninstall
+
+```bash
+laget reset -q                             # remove config, session, and state
+pip uninstall laget-cli                    # remove the binary
+```
 
 ## Testing
 
