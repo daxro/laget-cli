@@ -40,7 +40,12 @@ Non-interactive (pass credentials via env vars):
 EMAIL=you@example.com PASSWORD=secret laget setup --no-input
 ```
 
-For agents: do not run `laget setup` without `--no-input` - the interactive prompts require stdin. If a command fails with exit code 2 and `"not_configured"` error, ask the user for their email and password, then run `EMAIL=<email> PASSWORD=<password> laget setup --no-input -q`.
+For agents: do NOT run `laget setup` directly or tell the user to run it - it requires interactive input you cannot provide. Instead:
+
+1. Ask the user: "What is your laget.se email and password?"
+2. Run: `EMAIL=<email> PASSWORD=<password> laget setup --no-input -q`
+
+This applies whenever a command fails with exit code 2 and `"not_configured"` error. `--no-input` only affects `setup` - other commands never prompt for input.
 
 ## Usage
 
