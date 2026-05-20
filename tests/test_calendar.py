@@ -13,10 +13,13 @@ from laget_cli.api.calendar import (
     _parse_assembly_time,
     _parse_notes,
     _parse_rsvp,
+    _parse_rsvp_form,
     fetch_calendar,
     fetch_calendar_range,
     fetch_event_detail,
+    submit_rsvp,
 )
+from laget_cli.errors import ParseError
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +251,47 @@ DETAIL_NO_NOTES_HTML = """
 </div>
 """
 
+DETAIL_MULTIPLE_RSVP_HTML = """
+<div class="fullCalendar__info">
+  <div class="fullCalendar__text">
+    <span class="fullCalendar__infoLabel">Anmälan: </span>
+    <a href="/TeamAlpha-P2021/Rsvp/99003/1234567">Alice Testsson har svarat kommer</a>
+    <a href="/TeamAlpha-P2021/Rsvp/99003/7654321">Bob Testsson har ej svarat</a>
+  </div>
+</div>
+"""
+
+RSVP_FORM_HTML = """
+<form id="js-rsvp-form" action="/Common/Event/SaveEventAnswer" method="post">
+  <input type="hidden" id="EventId" name="EventId" value="29705518">
+  <input type="hidden" id="EventUserId" name="EventUserId" value="335227096">
+  <input type="hidden" id="IsChild" name="IsChild" value="True">
+  <input type="hidden" id="ChildIdKey" name="ChildIdKey" value="abc123">
+  <input type="hidden" id="EventSiteName" name="EventSiteName" value="TeamAlpha-P2021">
+  <input type="hidden" name="siteName" value="TeamAlpha-P2021">
+  <input type="hidden" id="WillAttend" name="WillAttend" value="True">
+  <input type="submit" value="Spara">
+</form>
+"""
+
+RSVP_FORM_WITH_COMMENT_HTML = """
+<form id="js-rsvp-form" action="/Common/Event/SaveEventAnswer" method="post">
+  <input type="hidden" id="EventId" name="EventId" value="29705518">
+  <input type="hidden" id="EventUserId" name="EventUserId" value="335227096">
+  <input type="hidden" id="WillAttend" name="WillAttend" value="True">
+  <textarea name="Comment">old comment</textarea>
+</form>
+"""
+
+RSVP_WRAPPER_HTML = """
+<div id="rsvpModal" data-rsvp-event="29705518" data-rsvp-user="1234567">
+  <a class="js-rsvp-invites eventList__itemInner"
+     href="/Common/Rsvp/ModalContent?pk=29705518&amp;childId=1234567&amp;site=TeamAlpha-P2021"
+     data-eventid="29705518"
+     data-eventuserid="1234567">Training invite</a>
+</div>
+"""
+
 
 # ---------------------------------------------------------------------------
 # _parse_calendar_month tests
@@ -416,6 +460,7 @@ class TestParseRsvp:
     def test_kommer_inte_is_no(self):
         result = _parse_rsvp(DETAIL_TRAINING_WITH_MAPS_HTML)
         assert result["my_response"] == "no"
+        assert result["url"] == "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567"
 
     def test_kommer_is_yes(self):
         result = _parse_rsvp(DETAIL_NO_NOTES_HTML)
@@ -427,6 +472,126 @@ class TestParseRsvp:
 
     def test_no_rsvp_returns_none(self):
         assert _parse_rsvp(DETAIL_NO_RSVP_HTML) is None
+
+    def test_absolute_rsvp_url_is_preserved(self):
+        html = DETAIL_NO_NOTES_HTML.replace(
+            'href="/TeamAlpha-P2021/Rsvp/99002/1234567"',
+            'href="https://www.laget.se/TeamAlpha-P2021/Rsvp/99002/1234567"',
+        )
+        result = _parse_rsvp(html)
+        assert result["url"] == "https://www.laget.se/TeamAlpha-P2021/Rsvp/99002/1234567"
+
+    def test_multiple_rsvp_links_raise_parse_error(self):
+        with pytest.raises(ParseError):
+            _parse_rsvp(DETAIL_MULTIPLE_RSVP_HTML)
+
+
+class TestParseRsvpForm:
+    def test_parses_scoped_form_fields(self):
+        result = _parse_rsvp_form(f"<form id='other'><input name='EventId' value='wrong'></form>{RSVP_FORM_HTML}", "29705518")
+        assert result["action"] == "/Common/Event/SaveEventAnswer"
+        assert result["fields"]["EventId"] == "29705518"
+        assert result["fields"]["EventUserId"] == "335227096"
+        assert result["fields"]["WillAttend"] == "True"
+
+    def test_event_id_mismatch_raises(self):
+        with pytest.raises(ParseError):
+            _parse_rsvp_form(RSVP_FORM_HTML, "999")
+
+    def test_missing_required_field_raises(self):
+        html = RSVP_FORM_HTML.replace('name="EventUserId"', 'name="MissingEventUserId"')
+        with pytest.raises(ParseError):
+            _parse_rsvp_form(html, "29705518")
+
+    def test_missing_form_action_raises(self):
+        html = RSVP_FORM_HTML.replace(' action="/Common/Event/SaveEventAnswer"', "")
+        with pytest.raises(ParseError):
+            _parse_rsvp_form(html, "29705518")
+
+    def test_multiple_forms_raise(self):
+        with pytest.raises(ParseError):
+            _parse_rsvp_form(RSVP_FORM_HTML + RSVP_FORM_HTML, "29705518")
+
+
+class TestSubmitRsvp:
+    def _session(self, html=RSVP_FORM_HTML):
+        session = MagicMock()
+        get_resp = MagicMock()
+        get_resp.text = html
+        get_resp.raise_for_status = MagicMock()
+        post_resp = MagicMock()
+        post_resp.raise_for_status = MagicMock()
+        session.get.return_value = get_resp
+        session.post.return_value = post_resp
+        return session, post_resp
+
+    def test_posts_yes_with_preserved_fields(self):
+        session, _ = self._session()
+        submit_rsvp(session, "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567", "yes", event_id="29705518")
+
+        session.post.assert_called_once()
+        url = session.post.call_args[0][0]
+        data = session.post.call_args[1]["data"]
+        headers = session.post.call_args[1]["headers"]
+        assert url == "https://www.laget.se/Common/Event/SaveEventAnswer"
+        assert data["EventUserId"] == "335227096"
+        assert data["ChildIdKey"] == "abc123"
+        assert data["WillAttend"] == "True"
+        assert headers["X-Requested-With"] == "XMLHttpRequest"
+
+    def test_posts_no(self):
+        session, _ = self._session()
+        submit_rsvp(session, "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567", "no", event_id="29705518")
+        assert session.post.call_args[1]["data"]["WillAttend"] == "False"
+
+    def test_posts_comment_when_textarea_exists(self):
+        session, _ = self._session(RSVP_FORM_WITH_COMMENT_HTML)
+        submit_rsvp(
+            session,
+            "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567",
+            "no",
+            comment="Sjuk idag",
+            event_id="29705518",
+        )
+        assert session.post.call_args[1]["data"]["Comment"] == "Sjuk idag"
+
+    def test_rejects_comment_without_textarea(self):
+        session, _ = self._session()
+        with pytest.raises(ParseError):
+            submit_rsvp(
+                session,
+                "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567",
+                "yes",
+                comment="Sjuk idag",
+                event_id="29705518",
+            )
+
+    def test_uses_timeout_on_get_and_post(self):
+        session, _ = self._session()
+        submit_rsvp(session, "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567", "yes", event_id="29705518")
+        assert "timeout" in session.get.call_args[1]
+        assert "timeout" in session.post.call_args[1]
+
+    def test_follows_modal_link_when_rsvp_page_wraps_form(self):
+        session = MagicMock()
+        wrapper_resp = MagicMock()
+        wrapper_resp.text = RSVP_WRAPPER_HTML
+        wrapper_resp.raise_for_status = MagicMock()
+        form_resp = MagicMock()
+        form_resp.text = RSVP_FORM_HTML
+        form_resp.raise_for_status = MagicMock()
+        post_resp = MagicMock()
+        post_resp.raise_for_status = MagicMock()
+        session.get.side_effect = [wrapper_resp, form_resp]
+        session.post.return_value = post_resp
+
+        submit_rsvp(session, "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567", "yes", event_id="29705518")
+
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[1][0][0] == (
+            "https://www.laget.se/Common/Rsvp/ModalContent?pk=29705518&childId=1234567&site=TeamAlpha-P2021"
+        )
+        assert session.post.call_args[1]["data"]["WillAttend"] == "True"
 
 
 
@@ -595,7 +760,7 @@ class TestCalendarCommand:
         events = [
             {
                 "id": "123", "type": "training", "title": "Träning",
-                "cancelled": False, "date": "2026-04-01T10:00:00",
+                "cancelled": False, "date": "2026-06-01T10:00:00",
                 "start_time": "10:00", "end_time": "11:00",
                 "location": None, "assembly_time": None, "location_url": None,
                 "notes": None, "rsvp": None,
@@ -676,6 +841,89 @@ class TestEventCommand:
     def test_team_substring_match(self):
         result = self._run(["event", "--team", "TeamAlpha", "29705518"])
         assert result["team"] == "P2021"
+
+
+class TestRsvpCommand:
+    def _detail(self, response="unanswered", rsvp_url="https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567"):
+        return {
+            "id": "29705518", "team": None, "team_slug": "TeamAlpha-P2021",
+            "type": None, "title": None, "cancelled": False,
+            "date": None, "start_time": None, "end_time": None,
+            "assembly_time": None, "location": "Sjöängsskolan",
+            "location_url": None, "notes": None,
+            "rsvp": {
+                "yes": None,
+                "no": None,
+                "unanswered": None,
+                "my_response": response,
+                "url": rsvp_url,
+            } if rsvp_url else None,
+            "responses": [],
+        }
+
+    def _run(self, argv, details=None, teams_data=None):
+        from io import StringIO
+        from laget_cli.cli import main
+
+        if teams_data is None:
+            teams_data = [{"team_slug": "TeamAlpha-P2021", "name": "P2021", "club": "FK"}]
+        if details is None:
+            details = [self._detail("unanswered"), self._detail("yes")]
+
+        with patch("laget_cli.cli._get_session") as mock_session, \
+             patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
+             patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
+             patch("laget_cli.cli.fetch_event_detail", side_effect=details), \
+             patch("laget_cli.cli.submit_rsvp") as mock_submit, \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
+            mock_session.return_value = MagicMock()
+            with patch("sys.argv", ["laget"] + argv):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    main()
+                return json.loads(out.getvalue()), mock_submit
+
+    def test_submits_refetches_verifies_and_outputs_json(self):
+        result, mock_submit = self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "yes"])
+        assert result["team"] == "P2021"
+        assert result["rsvp"]["my_response"] == "yes"
+        mock_submit.assert_called_once()
+        assert mock_submit.call_args[0][1] == "https://www.laget.se/TeamAlpha-P2021/Rsvp/29705518/1234567"
+        assert mock_submit.call_args[0][2] == "yes"
+        assert mock_submit.call_args[1]["event_id"] == "29705518"
+
+    def test_passes_comment_to_submit(self):
+        _, mock_submit = self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "no", "--comment", "Sjuk idag"],
+                                   details=[self._detail("unanswered"), self._detail("no")])
+        assert mock_submit.call_args[1]["comment"] == "Sjuk idag"
+
+    def test_fields_filters_output(self):
+        result, _ = self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "yes", "--fields", "id,rsvp"])
+        assert set(result.keys()) == {"id", "rsvp"}
+
+    def test_unknown_team_exits_4(self):
+        with pytest.raises(SystemExit) as exc:
+            self._run(["rsvp", "--team", "NoSuchTeam", "29705518", "yes"])
+        assert exc.value.code == 4
+
+    def test_no_rsvp_link_exits_4(self):
+        with pytest.raises(SystemExit) as exc:
+            self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "yes"], details=[self._detail(rsvp_url=None)])
+        assert exc.value.code == 4
+
+    def test_verification_mismatch_exits_1(self):
+        with pytest.raises(SystemExit) as exc:
+            self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "yes"],
+                      details=[self._detail("unanswered"), self._detail("no")])
+        assert exc.value.code == 1
+
+    def test_invalid_response_exits_2(self):
+        from laget_cli.cli import main
+
+        with patch("sys.argv", ["laget", "rsvp", "--team", "TeamAlpha-P2021", "29705518", "maybe"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 2
 
 
 # ---------------------------------------------------------------------------

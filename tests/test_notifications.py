@@ -367,7 +367,7 @@ class TestNotificationsCommand:
                 "url": "/TeamAlpha-P2021/News/9876",
             }
         ]
-        result = self._run(["notifications"], notifications)
+        result = self._run(["notifications", "--since", "all"], notifications)
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["type"] == "news_comment"
@@ -381,7 +381,7 @@ class TestNotificationsCommand:
             {"date": "2026-03-27T00:00:00", "type": "rsvp", "author": "C",
              "title": "t", "team": None, "team_slug": "TeamAlpha-P2021", "url": "/x/Event/1"},
         ]
-        result = self._run(["notifications"], notifications)
+        result = self._run(["notifications", "--since", "all"], notifications)
         dates = [r["date"] for r in result]
         assert dates == sorted(dates, reverse=True)
 

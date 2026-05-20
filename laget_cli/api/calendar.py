@@ -3,8 +3,11 @@
 import re
 from datetime import date
 from html import unescape
+from html.parser import HTMLParser
+from urllib.parse import urljoin
 
 from laget_cli.api.normalize import _normalize_event_type, _normalize_time, _strip_html
+from laget_cli.errors import ParseError
 from laget_cli.session import AJAX_HEADERS, BASE_URL, HTTP_TIMEOUT
 
 
@@ -300,16 +303,18 @@ def _parse_rsvp(html):
     if "Anmälan:" not in html:
         return None
 
-    # Find the RSVP link text
-    m = re.search(
-        r'<a\s+href="[^"]*/Rsvp/[^"]*">\s*(.*?)\s*</a>',
+    matches = re.findall(
+        r'<a\b[^>]*href="([^"]*/Rsvp/[^"]*)"[^>]*>\s*(.*?)\s*</a>',
         html,
         re.DOTALL,
     )
-    if not m:
+    if not matches:
         return None
+    if len(matches) > 1:
+        raise ParseError("Found multiple RSVP links in event detail")
 
-    rsvp_text = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    href, link_html = matches[0]
+    rsvp_text = re.sub(r"<[^>]+>", "", link_html).strip()
 
     my_response = "unanswered"
     if re.search(r'har svarat kommer inte', rsvp_text, re.IGNORECASE):
@@ -324,4 +329,183 @@ def _parse_rsvp(html):
         "no": None,
         "unanswered": None,
         "my_response": my_response,
+        "url": urljoin(BASE_URL, unescape(href)),
     }
+
+
+class _RsvpFormParser(HTMLParser):
+    """Parse the user-specific RSVP form without touching unrelated page forms."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self._current = None
+        self._in_textarea = False
+        self._textarea_name = None
+        self._textarea_text = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form" and attrs.get("id") == "js-rsvp-form":
+            self._current = {
+                "action": attrs.get("action"),
+                "fields": {},
+                "textareas": [],
+            }
+            return
+
+        if self._current is None:
+            return
+
+        if tag == "input":
+            name = attrs.get("name")
+            if name:
+                self._current["fields"][name] = attrs.get("value", "")
+        elif tag == "textarea":
+            self._in_textarea = True
+            self._textarea_name = attrs.get("name")
+            self._textarea_text = []
+
+    def handle_data(self, data):
+        if self._in_textarea:
+            self._textarea_text.append(data)
+
+    def handle_endtag(self, tag):
+        if self._current is None:
+            return
+
+        if tag == "textarea":
+            if self._textarea_name:
+                text = "".join(self._textarea_text)
+                self._current["fields"][self._textarea_name] = unescape(text)
+                self._current["textareas"].append(self._textarea_name)
+            self._in_textarea = False
+            self._textarea_name = None
+            self._textarea_text = []
+        elif tag == "form":
+            self.forms.append(self._current)
+            self._current = None
+
+
+class _RsvpInviteParser(HTMLParser):
+    """Find RSVP modal links embedded in the full RSVP page."""
+
+    def __init__(self):
+        super().__init__()
+        self.invites = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        attrs = dict(attrs)
+        classes = attrs.get("class", "").split()
+        if "js-rsvp-invites" not in classes:
+            return
+        href = attrs.get("href")
+        event_id = attrs.get("data-eventid")
+        user_id = attrs.get("data-eventuserid")
+        if href and event_id and user_id:
+            self.invites.append({
+                "href": unescape(href),
+                "event_id": event_id,
+                "user_id": user_id,
+            })
+
+
+def _parse_rsvp_form(html, expected_event_id=None):
+    """Return the scoped RSVP form action and named fields."""
+    parser = _RsvpFormParser()
+    parser.feed(html)
+
+    if len(parser.forms) != 1:
+        raise ParseError(f"Expected one RSVP form, found {len(parser.forms)}")
+
+    form = parser.forms[0]
+    action = form["action"]
+    if not action:
+        raise ParseError("RSVP form is missing action")
+
+    fields = form["fields"]
+    required = {"EventId", "EventUserId", "WillAttend"}
+    missing = sorted(required - set(fields))
+    if missing:
+        raise ParseError(f"RSVP form is missing required fields: {', '.join(missing)}")
+
+    if expected_event_id is not None and fields["EventId"] != str(expected_event_id):
+        raise ParseError(f"RSVP form EventId {fields['EventId']} does not match {expected_event_id}")
+
+    return {
+        "action": action,
+        "fields": fields,
+        "textareas": form["textareas"],
+    }
+
+
+def _extract_rsvp_url_ids(rsvp_url):
+    m = re.search(r"/Rsvp/([^/?#]+)/([^/?#]+)", rsvp_url)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def _find_rsvp_modal_url(html, rsvp_url, expected_event_id=None):
+    url_event_id, url_user_id = _extract_rsvp_url_ids(rsvp_url)
+    event_id = str(expected_event_id) if expected_event_id is not None else url_event_id
+    if not event_id or not url_user_id:
+        raise ParseError("Could not identify RSVP event/user from URL")
+
+    parser = _RsvpInviteParser()
+    parser.feed(html)
+    matches = [
+        invite for invite in parser.invites
+        if invite["event_id"] == event_id and invite["user_id"] == url_user_id
+    ]
+    if len(matches) != 1:
+        raise ParseError(f"Expected one matching RSVP modal link, found {len(matches)}")
+    return urljoin(rsvp_url, matches[0]["href"])
+
+
+def submit_rsvp(session, rsvp_url, response, comment=None, event_id=None):
+    """Submit an RSVP response using the exact user-specific RSVP form URL."""
+    if response not in {"yes", "no"}:
+        raise ValueError("response must be 'yes' or 'no'")
+
+    resp = session.get(
+        rsvp_url,
+        headers=AJAX_HEADERS,
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+    try:
+        form = _parse_rsvp_form(resp.text, expected_event_id=event_id)
+        form_url = rsvp_url
+    except ParseError as e:
+        if "found 0" not in str(e):
+            raise
+        form_url = _find_rsvp_modal_url(resp.text, rsvp_url, expected_event_id=event_id)
+        resp = session.get(
+            form_url,
+            headers=AJAX_HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        form = _parse_rsvp_form(resp.text, expected_event_id=event_id)
+
+    data = dict(form["fields"])
+    data["WillAttend"] = "True" if response == "yes" else "False"
+
+    if comment is not None:
+        if not form["textareas"]:
+            raise ParseError("RSVP form does not support comments")
+        data[form["textareas"][0]] = comment
+
+    action_url = urljoin(form_url, form["action"])
+    post_resp = session.post(
+        action_url,
+        data=data,
+        headers=AJAX_HEADERS,
+        timeout=HTTP_TIMEOUT,
+    )
+    post_resp.raise_for_status()
+    return post_resp

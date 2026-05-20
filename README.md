@@ -54,6 +54,8 @@ laget calendar                                # upcoming events (default: next 3
 laget calendar --since 2026-04-01 --until 2026-04-30
 laget calendar --team P2019 --limit 5         # filter by team, cap results
 laget event --team P2019 12345                # event detail with RSVP
+laget rsvp --team P2019 12345 yes             # RSVP yes/no to an event
+laget rsvp --team P2019 12345 no --comment "Sjuk idag"
 laget notifications                           # activity feed (default: last 30 days)
 laget notifications --since all               # all notifications, no date limit
 laget notifications --team Knatte --limit 10  # filter by team, cap results
@@ -61,7 +63,7 @@ laget news --team P2019 67890                 # full article with comments
 laget reset                                   # remove config, session, and state files
 ```
 
-All data commands output JSON to stdout. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
+All data commands output JSON to stdout. `laget rsvp` is a write command that updates your event RSVP before outputting JSON. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
 
 For agents: pipe through `jq` for field extraction, e.g. `laget notifications -q | jq '.[].type'`. Use `laget status --json -q | jq '.configured'` to verify setup.
 
@@ -75,8 +77,9 @@ For agents: pipe through `jq` for field extraction, e.g. `laget notifications -q
 | --debug | Log HTTP requests to stderr |
 | --since DATE | Start date (YYYY-MM-DD or 'all'). Notifications default: 30 days ago. Calendar default: today |
 | --until DATE | End date (YYYY-MM-DD or 'all'). Notifications default: no limit. Calendar default: 30 days from today |
-| --team SLUG | Filter by team slug (case-insensitive substring match). For news/event, ambiguous matches use the first result |
+| --team SLUG | Filter by team slug (case-insensitive substring match). For news/event/rsvp, ambiguous matches use the first result |
 | --limit N | Maximum number of results to return |
+| --comment TEXT | Optional RSVP comment for `laget rsvp` when the event form supports comments |
 | --version | Show version and exit |
 | --json | Output as JSON (status only) |
 
@@ -162,6 +165,34 @@ Calendar:
     ]
   }
 ]
+```
+
+RSVP (`laget rsvp --team P2019 12345 yes`):
+
+```json
+{
+  "id": "12345",
+  "team": "P2021",
+  "team_slug": "ExampleFC-P2021",
+  "type": null,
+  "title": null,
+  "cancelled": false,
+  "date": null,
+  "start_time": null,
+  "end_time": null,
+  "assembly_time": null,
+  "location": "Sporthallen",
+  "location_url": null,
+  "notes": null,
+  "rsvp": {
+    "yes": null,
+    "no": null,
+    "unanswered": null,
+    "my_response": "yes",
+    "url": "https://www.laget.se/ExampleFC-P2021/Rsvp/12345/1234567"
+  },
+  "responses": []
+}
 ```
 
 Notifications:

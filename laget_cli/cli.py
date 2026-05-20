@@ -22,7 +22,7 @@ from laget_cli.errors import (
     EXIT_NOT_FOUND,
     EXIT_USAGE,
 )
-from laget_cli.api import fetch_article, fetch_calendar_range, fetch_event_detail, fetch_notifications, fetch_teams, fetch_children, filter_teams_by_club, sync_child_team_mapping
+from laget_cli.api import fetch_article, fetch_calendar_range, fetch_event_detail, fetch_notifications, fetch_teams, fetch_children, filter_teams_by_club, submit_rsvp, sync_child_team_mapping
 from laget_cli.api.notifications import resolve_team_names
 from laget_cli.paths import CONFIG_DIR, CONFIG_FILE, SESSION_FILE, STATE_DIR, STATE_FILE
 from laget_cli.session import login
@@ -496,6 +496,39 @@ def _event(args):
     _output_json(detail, args)
 
 
+def _rsvp(args):
+    session = _get_session(args.quiet)
+    config = dotenv_values(CONFIG_FILE)
+    club_filter = config.get("CLUB")
+
+    teams = fetch_teams(session)
+    teams = filter_teams_by_club(teams, club_filter)
+    team_slug, team_name = _resolve_team_slug(args.team, teams)
+
+    _progress(f"Fetching event {args.id}...", args.quiet)
+    detail = fetch_event_detail(session, team_slug, args.id)
+    rsvp = detail.get("rsvp")
+    rsvp_url = rsvp.get("url") if rsvp else None
+    if not rsvp_url:
+        emit_error("rsvp_not_found", f"Event {args.id} has no RSVP link.", exit_code=EXIT_NOT_FOUND)
+
+    _progress(f"Submitting RSVP for event {args.id}...", args.quiet)
+    submit_rsvp(session, rsvp_url, args.response, comment=args.comment, event_id=args.id)
+
+    _progress(f"Verifying RSVP for event {args.id}...", args.quiet)
+    updated = fetch_event_detail(session, team_slug, args.id)
+    updated["team"] = team_name
+    updated_response = (updated.get("rsvp") or {}).get("my_response")
+    if updated_response != args.response:
+        emit_error(
+            "rsvp_update_failed",
+            f"RSVP update could not be verified: expected {args.response}, got {updated_response}.",
+            exit_code=EXIT_ERROR,
+        )
+
+    _output_json(updated, args)
+
+
 def _reset(args):
     """Remove all config, session, and state files."""
     deleted = []
@@ -563,7 +596,8 @@ def main():
   laget notifications --team tigers     Filter by team
   laget calendar --since 2026-01-01     Events since a date
   laget news --team tigers 12345        News article detail
-  laget event --team tigers 67890       Event with RSVP details""",
+  laget event --team tigers 67890       Event with RSVP details
+  laget rsvp --team tigers 67890 yes    RSVP yes/no to an event""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_pkg_version('laget-cli')}")
@@ -624,6 +658,13 @@ def main():
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
     event_parser.add_argument("id", help="Event ID")
 
+    rsvp_parser = subparsers.add_parser("rsvp", help="RSVP yes/no to an event",
+                                        parents=[_global_flags])
+    rsvp_parser.add_argument("--team", required=True, help="Team slug (or substring)")
+    rsvp_parser.add_argument("id", help="Event ID")
+    rsvp_parser.add_argument("response", choices=["yes", "no"], help="RSVP response")
+    rsvp_parser.add_argument("--comment", help="Optional RSVP comment when the event form supports comments")
+
     subparsers.add_parser("reset", parents=[_global_flags], help="Remove all config, session, and state files")
 
     if _HAS_ARGCOMPLETE:
@@ -652,6 +693,8 @@ def main():
             _calendar(args)
         elif args.command == "event":
             _event(args)
+        elif args.command == "rsvp":
+            _rsvp(args)
         elif args.command == "reset":
             _reset(args)
     except KeyboardInterrupt:
