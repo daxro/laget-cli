@@ -24,14 +24,35 @@ from laget_cli.errors import (
 )
 from laget_cli.api import fetch_article, fetch_calendar_range, fetch_event_detail, fetch_notifications, fetch_teams, fetch_children, filter_teams_by_club, submit_rsvp, sync_child_team_mapping
 from laget_cli.api.notifications import resolve_team_names
-from laget_cli.paths import CONFIG_DIR, CONFIG_FILE, SESSION_FILE, STATE_DIR, STATE_FILE
-from laget_cli.session import login
+from laget_cli.paths import CONFIG_FILE, SESSION_FILE, STATE_FILE, atomic_write_text
+from laget_cli.session import login, save_session
 
 try:
     import argcomplete
     _HAS_ARGCOMPLETE = True
 except ImportError:
     _HAS_ARGCOMPLETE = False
+
+
+_DEFAULT_SINCE_DAYS = 30
+_MAX_CALENDAR_MONTHS = 24
+
+_STATUS_FIELDS = {
+    "configured", "email", "club_filter", "session", "teams", "children",
+    "config_path", "session_path",
+}
+_NOTIFICATION_FIELDS = {"date", "type", "author", "title", "team", "team_slug", "url"}
+_CALENDAR_EVENT_FIELDS = {
+    "id", "type", "title", "cancelled", "date", "start_time", "end_time",
+    "location", "assembly_time", "location_url", "notes", "rsvp",
+}
+_NEWS_FIELDS = {
+    "id", "team", "team_slug", "title", "author", "date", "body",
+    "view_count", "comments",
+}
+_EVENT_FIELDS = _CALENDAR_EVENT_FIELDS | {"team", "team_slug", "responses"}
+_RESET_FIELDS = {"reset", "deleted", "failed"}
+_legacy_credentials_warned = False
 
 
 class _LagetParser(argparse.ArgumentParser):
@@ -43,9 +64,18 @@ class _LagetParser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE)
 
 
+def _load_config():
+    """Read the private config without expanding credential-like values."""
+    return dotenv_values(CONFIG_FILE, interpolate=False)
+
+
 def _configure_debug():
     """Enable debug logging of HTTP requests to stderr."""
     import logging
+    print(
+        "Warning: --debug output may contain sensitive data. Review it before sharing.",
+        file=sys.stderr,
+    )
     logging.basicConfig(
         format="%(levelname)s %(name)s: %(message)s",
         level=logging.DEBUG,
@@ -72,27 +102,49 @@ def _mask_email(email):
     return f"{masked}@{domain}"
 
 
+def _warn_legacy_credentials(source, quiet=False):
+    global _legacy_credentials_warned
+    if not quiet and not _legacy_credentials_warned:
+        print(
+            f"Warning: EMAIL and PASSWORD in {source} are deprecated; "
+            "use LAGET_EMAIL and LAGET_PASSWORD.",
+            file=sys.stderr,
+        )
+        _legacy_credentials_warned = True
+
+
+def _credentials_from_mapping(values, source, warn_legacy=False, quiet=False):
+    """Return namespaced credentials, with a temporary legacy fallback."""
+    email = values.get("LAGET_EMAIL")
+    password = values.get("LAGET_PASSWORD")
+    if email or password:
+        return email, password
+
+    email = values.get("EMAIL")
+    password = values.get("PASSWORD")
+    if (email or password) and warn_legacy:
+        _warn_legacy_credentials(source, quiet=quiet)
+    return email, password
+
+
 def _get_session(quiet=False):
-    """Authenticate and return a session. Syncs child-team mapping on auth. Exits if not configured."""
-    config = dotenv_values(CONFIG_FILE)
-    email = config.get("EMAIL")
-    password = config.get("PASSWORD")
+    """Authenticate and return a session without additional data fetching."""
+    config = _load_config()
+    email, password = _credentials_from_mapping(config, str(CONFIG_FILE))
     if not email or not password:
         emit_error("not_configured", "Credentials not set. Run: laget setup", exit_code=EXIT_USAGE)
     _progress("Authenticating...", quiet)
-    session = login(email, password, session_path=str(SESSION_FILE))
-    _sync_state(session, config, quiet)
-    return session
+    return login(email, password, session_path=str(SESSION_FILE))
 
 
-def _sync_state(session, config, quiet=False):
+def _sync_state(session, config, teams=None, children=None, quiet=False):
     """Sync child-team mapping after successful auth."""
     try:
-        teams = fetch_teams(session)
-        teams = filter_teams_by_club(teams, config.get("CLUB"))
-        children = fetch_children(session)
+        if teams is None:
+            teams = filter_teams_by_club(fetch_teams(session), config.get("CLUB"))
+        if children is None:
+            children = fetch_children(session)
         mapping = sync_child_team_mapping(session, teams, children)
-        # Build team name lookup
         team_names = {t["team_slug"]: t["name"] for t in teams}
         state = {
             "child_teams": {
@@ -100,11 +152,11 @@ def _sync_state(session, config, quiet=False):
                 for cid, slug in mapping.items()
             }
         }
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        _progress("Warning: could not sync child-team mapping.", quiet)
+        atomic_write_text(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
+        return state
+    except (OSError, KeyError, ParseError, requests.RequestException) as e:
+        _progress(f"Warning: could not sync child-team mapping: {e}", quiet)
+        return None
 
 
 def _load_state():
@@ -118,14 +170,14 @@ def _load_state():
         return {}
 
 
-def _get_status():
+def _get_status(session=None, config=None, teams=None, children=None):
     """Build status dict from config and session state."""
-    config = dotenv_values(CONFIG_FILE)
-    email = config.get("EMAIL")
+    config = _load_config() if config is None else config
+    email, password = _credentials_from_mapping(config, str(CONFIG_FILE))
     club_filter = config.get("CLUB")
 
     status = {
-        "configured": bool(email and config.get("PASSWORD")),
+        "configured": bool(email and password),
         "email": _mask_email(email) if email else None,
         "club_filter": club_filter,
         "session": None,
@@ -136,28 +188,40 @@ def _get_status():
     }
 
     if status["configured"]:
-        try:
-            session = _get_session(quiet=True)
-            status["session"] = "valid"
+        if session is None:
+            session = login(email, password, session_path=str(SESSION_FILE))
+        status["session"] = "valid"
+        teams_available = teams is not None
+        children_available = children is not None
+        if not teams_available:
             try:
                 teams = fetch_teams(session)
                 teams = filter_teams_by_club(teams, club_filter)
-                status["teams"] = teams
+                teams_available = True
             except (requests.RequestException, ParseError) as e:
                 print(f"Warning: could not fetch teams: {e}", file=sys.stderr)
+                teams = []
+        status["teams"] = teams
+        if not children_available:
             try:
                 children = fetch_children(session)
-                state = _load_state()
-                child_teams = state.get("child_teams", {})
-                for child in children:
-                    ct = child_teams.get(child["id"])
-                    child["team_slug"] = ct["team_slug"] if ct else None
-                    child["team_name"] = ct["team_name"] if ct else None
-                status["children"] = children
+                children_available = True
             except (requests.RequestException, ParseError, KeyError) as e:
                 print(f"Warning: could not fetch children: {e}", file=sys.stderr)
-        except SystemExit:
-            status["session"] = "expired"
+                children = []
+
+        state = (
+            _sync_state(session, config, teams=teams, children=children, quiet=True)
+            if teams_available and children_available
+            else None
+        )
+        state = state if state is not None else _load_state()
+        child_teams = state.get("child_teams", {})
+        for child in children:
+            ct = child_teams.get(child["id"])
+            child["team_slug"] = ct["team_slug"] if ct else None
+            child["team_name"] = ct["team_name"] if ct else None
+        status["children"] = children
 
     return status
 
@@ -190,9 +254,12 @@ def _print_status(status):
 
 
 def _status(args):
+    if getattr(args, "fields", None) and not getattr(args, "json_output", False):
+        emit_error("invalid_input", "--fields requires status --json.", exit_code=EXIT_USAGE)
+    _validate_fields(args, _STATUS_FIELDS, "status")
     status = _get_status()
     if getattr(args, "json_output", False):
-        _output_json(status, args)
+        _output_json(status, args, _STATUS_FIELDS)
     else:
         _print_status(status)
     if not status["configured"]:
@@ -200,91 +267,180 @@ def _status(args):
 
 
 def _setup(args):
-    print_logo()
-    if getattr(args, "no_input", False) or not sys.stdin.isatty():
-        email = os.environ.get("EMAIL")
-        password = os.environ.get("PASSWORD")
+    _reject_fields(args, "setup")
+    non_interactive = getattr(args, "no_input", False) or not sys.stdin.isatty()
+    if not non_interactive:
+        print_logo()
+    existing_config = _load_config()
+    existing_email, existing_password = _credentials_from_mapping(
+        existing_config, str(CONFIG_FILE)
+    )
+
+    if non_interactive:
+        email, password = _credentials_from_mapping(
+            os.environ,
+            "the environment",
+            warn_legacy=True,
+            quiet=args.quiet,
+        )
         if not email or not password:
             emit_error(
                 "setup_required",
-                "EMAIL and PASSWORD env vars required in non-interactive mode.",
+                "LAGET_EMAIL and LAGET_PASSWORD are required in non-interactive mode.",
                 exit_code=EXIT_USAGE,
-            )
-        _write_env(email, password)
-        _progress("Saved credentials.", args.quiet)
-        login(email, password, session_path=str(SESSION_FILE))
+        )
+        _validate_credentials(email, password)
+        session = login(email, password, session_path=None)
+        same_account = bool(
+            existing_email and email.casefold() == existing_email.casefold()
+        )
+        club = (
+            existing_config.get("CLUB")
+            if same_account
+            else None
+        )
+        _persist_setup(email, password, club, session, reset_state=not same_account)
         _progress("Authenticated.", args.quiet)
-        _print_status(_get_status())
+        config = _config_values(email, password, club)
+        _print_status(_get_status(session=session, config=config))
         return
 
-    existing_email = dotenv_values(CONFIG_FILE).get("EMAIL") if CONFIG_FILE.exists() else None
     if existing_email:
         print(f"Already configured ({_mask_email(existing_email)})", file=sys.stderr)
         answer = input("Overwrite? [y/N] ").strip().lower()
         if answer != "y":
-            config = dotenv_values(CONFIG_FILE)
-            login(config["EMAIL"], config["PASSWORD"], session_path=str(SESSION_FILE))
+            login(existing_email, existing_password, session_path=str(SESSION_FILE))
             _progress("Authenticated.", args.quiet)
             return
 
     email = input("Email: ").strip()
     password = getpass.getpass("Password: ")
-    if not email or not password:
-        emit_error("invalid_input", "Email and password are required.", exit_code=EXIT_USAGE)
+    _validate_credentials(email, password)
 
-    # Save credentials first (before auth attempt)
-    _write_env(email, password)
-    _progress(f"Saved to {CONFIG_FILE}", args.quiet)
+    session = login(email, password, session_path=None)
+    same_account = bool(existing_email and email.casefold() == existing_email.casefold())
+    club = None
+    teams = None
 
-    # Authenticate
-    session = login(email, password, session_path=str(SESSION_FILE))
-    print("Setup complete. Authenticated successfully.", file=sys.stderr)
-
-    # Offer club filter selection
     try:
         teams = fetch_teams(session)
         clubs = sorted(set(t["club"] for t in teams))
         if len(clubs) > 1:
             print("\nYour teams span multiple clubs:", file=sys.stderr)
-            for i, club in enumerate(clubs, 1):
-                club_teams = [t["name"] for t in teams if t["club"] == club]
-                print(f"  {i}. {club} ({', '.join(club_teams)})", file=sys.stderr)
+            for i, club_name in enumerate(clubs, 1):
+                club_teams = [t["name"] for t in teams if t["club"] == club_name]
+                print(f"  {i}. {club_name} ({', '.join(club_teams)})", file=sys.stderr)
             print(f"  0. Show all (no filter)", file=sys.stderr)
             choice = input("\nFilter by club [0]: ").strip()
             if choice and choice != "0" and choice.isdigit() and 1 <= int(choice) <= len(clubs):
-                selected_club = clubs[int(choice) - 1]
-                _write_env(email, password, club=selected_club)
-                _progress(f"Club filter set to: {selected_club}", args.quiet)
-    except Exception:
-        print("Warning: could not fetch teams for club selection.", file=sys.stderr)
+                club = clubs[int(choice) - 1]
+            elif choice == "0":
+                club = None
+    except (ParseError, requests.RequestException) as e:
+        print(f"Warning: could not fetch teams for club selection: {e}", file=sys.stderr)
 
-    # Show status after successful setup
-    _print_status(_get_status())
+    _persist_setup(email, password, club, session, reset_state=not same_account)
+    _progress(f"Saved credentials to {CONFIG_FILE}.", args.quiet)
+    _progress("Setup complete. Authenticated successfully.", args.quiet)
+    config = _config_values(email, password, club)
+    if teams is not None:
+        teams = filter_teams_by_club(teams, club)
+    _print_status(_get_status(session=session, config=config, teams=teams))
+
+
+def _validate_credentials(email, password):
+    if not email or not password:
+        emit_error("invalid_input", "Email and password are required.", exit_code=EXIT_USAGE)
+    if "\n" in email or "\r" in email or "\n" in password or "\r" in password:
+        emit_error(
+            "invalid_input",
+            "Email and password must not contain newline characters.",
+            exit_code=EXIT_USAGE,
+        )
+
+
+def _dotenv_quote(value):
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+
+def _config_values(email, password, club=None, default_since_days=None):
+    config = {"LAGET_EMAIL": email, "LAGET_PASSWORD": password}
+    if club:
+        config["CLUB"] = club
+    if default_since_days:
+        config["DEFAULT_SINCE_DAYS"] = default_since_days
+    return config
 
 
 def _write_env(email, password, club=None):
     """Write credentials to config file."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    lines = [f"EMAIL={email}\n", f"PASSWORD={password}\n"]
+    existing = _load_config()
+    lines = [
+        f"LAGET_EMAIL={_dotenv_quote(email)}\n",
+        f"LAGET_PASSWORD={_dotenv_quote(password)}\n",
+    ]
     if club:
-        lines.append(f"CLUB={club}\n")
-    with open(CONFIG_FILE, "w") as f:
-        f.writelines(lines)
-    os.chmod(CONFIG_FILE, 0o600)
+        lines.append(f"CLUB={_dotenv_quote(club)}\n")
+    if existing.get("DEFAULT_SINCE_DAYS"):
+        lines.append(f"DEFAULT_SINCE_DAYS={existing['DEFAULT_SINCE_DAYS']}\n")
+    atomic_write_text(CONFIG_FILE, "".join(lines))
 
 
-_DEFAULT_SINCE_DAYS = 30
+def _persist_setup(email, password, club, session, reset_state=False):
+    """Persist setup files transactionally, invalidating state on account switch."""
+    previous_config = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else None
+    previous_session = SESSION_FILE.read_text(encoding="utf-8") if SESSION_FILE.exists() else None
+    previous_state = (
+        STATE_FILE.read_text(encoding="utf-8")
+        if reset_state and STATE_FILE.exists()
+        else None
+    )
+    try:
+        _write_env(email, password, club)
+        save_session(session, SESSION_FILE)
+        if reset_state:
+            atomic_write_text(STATE_FILE, json.dumps({"child_teams": {}}, indent=2))
+    except Exception:
+        _restore_file(CONFIG_FILE, previous_config)
+        _restore_file(SESSION_FILE, previous_session)
+        if reset_state:
+            _restore_file(STATE_FILE, previous_state)
+        raise
+
+
+def _restore_file(path, previous_text):
+    if previous_text is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        atomic_write_text(path, previous_text)
 
 
 def _validate_date_flag(value, flag_name):
-    """Validate a date flag is YYYY-MM-DD or 'all'. Returns value, None, or exits."""
+    """Validate a date flag is a real YYYY-MM-DD date or 'all'."""
     if value is None:
         return None
     if value.lower() == "all":
         return None
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         emit_error("invalid_input", f"{flag_name} must be YYYY-MM-DD or 'all'.", exit_code=EXIT_USAGE)
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        emit_error("invalid_input", f"{flag_name} must be a real calendar date.", exit_code=EXIT_USAGE)
     return value
+
+
+def _validate_date_range(since, until):
+    if since is not None and until is not None and since > until:
+        emit_error(
+            "invalid_input",
+            "--since must be on or before --until.",
+            exit_code=EXIT_USAGE,
+        )
 
 
 def _resolve_since(cli_value, config):
@@ -312,44 +468,145 @@ def _resolve_until(cli_value):
     return None
 
 
-def _filter_fields(data, fields_str):
-    """Filter JSON output to only include specified fields.
+def _positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be a positive integer") from e
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
-    Args:
-        data: list of dicts, or a dict
-        fields_str: comma-separated field names, or None (no filtering)
 
-    Returns filtered data (same structure, fewer keys).
-    """
-    if fields_str is None:
+def _numeric_id(value):
+    if not re.fullmatch(r"\d+", value):
+        raise argparse.ArgumentTypeError("must contain digits only")
+    return value
+
+
+def _validate_fields(args, allowed_fields, command):
+    """Validate and cache a command's selected output fields."""
+    fields_str = getattr(args, "fields", None)
+    if not isinstance(fields_str, str):
+        return None
+    fields = {field.strip() for field in fields_str.split(",") if field.strip()}
+    if not fields:
+        emit_error("invalid_input", "--fields must not be empty.", exit_code=EXIT_USAGE)
+    unknown = sorted(fields - allowed_fields)
+    if unknown:
+        emit_error(
+            "invalid_input",
+            f"Unsupported --fields for {command}: {', '.join(unknown)}.",
+            exit_code=EXIT_USAGE,
+        )
+    args.selected_fields = fields
+    return fields
+
+
+def _reject_fields(args, command):
+    if isinstance(getattr(args, "fields", None), str):
+        emit_error(
+            "invalid_input",
+            f"--fields is not supported by {command}.",
+            exit_code=EXIT_USAGE,
+        )
+
+
+def _filter_fields(data, fields, nested_list_key=None):
+    """Filter top-level dicts or records nested under an envelope key."""
+    if fields is None:
         return data
-    fields = {f.strip() for f in fields_str.split(",")}
+    if nested_list_key is not None:
+        return [
+            {
+                **item,
+                nested_list_key: [
+                    {key: value for key, value in record.items() if key in fields}
+                    for record in item[nested_list_key]
+                ],
+            }
+            for item in data
+        ]
     if isinstance(data, list):
-        return [{k: v for k, v in item.items() if k in fields} for item in data]
+        return [{key: value for key, value in item.items() if key in fields} for item in data]
     if isinstance(data, dict):
-        return {k: v for k, v in data.items() if k in fields}
+        return {key: value for key, value in data.items() if key in fields}
     return data
 
 
-def _output_json(data, args):
+def _output_json(data, args, allowed_fields, nested_list_key=None):
     """Print data as JSON to stdout, applying --fields filter if set."""
-    fields_str = getattr(args, "fields", None)
-    data = _filter_fields(data, fields_str)
+    fields = getattr(args, "selected_fields", None)
+    if not isinstance(fields, set):
+        fields = None
+    if fields is None and isinstance(getattr(args, "fields", None), str):
+        fields = _validate_fields(args, allowed_fields, args.command)
+    data = _filter_fields(data, fields, nested_list_key=nested_list_key)
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _shift_year(value, years):
+    try:
+        return value.replace(year=value.year + years)
+    except ValueError:
+        return value.replace(year=value.year + years, day=28)
+
+
+def _month_start_after(value, months):
+    month_index = value.year * 12 + value.month - 1 + months
+    return date(month_index // 12, month_index % 12 + 1, 1)
+
+
+def _calendar_range(raw_since, raw_until, today):
+    """Resolve bounded calendar dates, including bounded 'all' aliases."""
+    since_all = raw_since is not None and raw_since.lower() == "all"
+    until_all = raw_until is not None and raw_until.lower() == "all"
+    since_date = (
+        today
+        if raw_since is None
+        else _shift_year(today, -1)
+        if since_all
+        else date.fromisoformat(_validate_date_flag(raw_since, "--since"))
+    )
+    until_date = (
+        today + timedelta(days=30)
+        if raw_until is None
+        else _shift_year(today, 1)
+        if until_all
+        else date.fromisoformat(_validate_date_flag(raw_until, "--until"))
+    )
+    if since_all and until_all:
+        until_date = _month_start_after(since_date, _MAX_CALENDAR_MONTHS) - timedelta(days=1)
+    since = since_date.isoformat()
+    until = until_date.isoformat()
+    _validate_date_range(since, until)
+    month_count = (
+        (date.fromisoformat(until).year - date.fromisoformat(since).year) * 12
+        + date.fromisoformat(until).month
+        - date.fromisoformat(since).month
+        + 1
+    )
+    if month_count > _MAX_CALENDAR_MONTHS:
+        emit_error(
+            "invalid_input",
+            f"Calendar date range may span at most {_MAX_CALENDAR_MONTHS} months.",
+            exit_code=EXIT_USAGE,
+        )
+    return since, until
 
 
 def _filter_items_since(items, since, date_key="date"):
     """Filter items where item[date_key] >= since. None = no filter."""
     if since is None:
         return items
-    return [item for item in items if item[date_key] >= since]
+    return [item for item in items if item.get(date_key) and item[date_key] >= since]
 
 
 def _filter_items_until(items, until, date_key="date"):
     """Filter items where item[date_key][:10] <= until. None = no filter."""
     if until is None:
         return items
-    return [item for item in items if item[date_key][:10] <= until]
+    return [item for item in items if item.get(date_key) and item[date_key][:10] <= until]
 
 
 def _filter_by_team(items, team_filter):
@@ -361,9 +618,11 @@ def _filter_by_team(items, team_filter):
 
 
 def _notifications(args):
-    config = dotenv_values(CONFIG_FILE)
+    _validate_fields(args, _NOTIFICATION_FIELDS, "notifications")
+    config = _load_config()
     since = _resolve_since(getattr(args, "since", None), config)
     until = _resolve_until(getattr(args, "until", None))
+    _validate_date_range(since, until)
     team_filter = getattr(args, "team", None)
 
     session = _get_session(quiet=args.quiet)
@@ -391,12 +650,13 @@ def _notifications(args):
     if limit is not None:
         notifications = notifications[:limit]
 
-    _output_json(notifications, args)
+    _output_json(notifications, args, _NOTIFICATION_FIELDS)
 
 
 def _news(args):
+    _validate_fields(args, _NEWS_FIELDS, "news")
     session = _get_session(args.quiet)
-    config = dotenv_values(CONFIG_FILE)
+    config = _load_config()
     club_filter = config.get("CLUB")
 
     teams = fetch_teams(session)
@@ -408,10 +668,10 @@ def _news(args):
     article["team"] = team_name
     article["team_slug"] = team_slug
 
-    _output_json(article, args)
+    _output_json(article, args, _NEWS_FIELDS)
 
 
-def _resolve_team_slug(args_team, teams):
+def _resolve_team_slug(args_team, teams, exact=False):
     """Resolve a team arg (exact slug or substring) to (team_slug, team_name).
 
     Exits with an error if no match or ambiguous match.
@@ -419,37 +679,34 @@ def _resolve_team_slug(args_team, teams):
     team_slugs = {t["team_slug"]: t["name"] for t in teams}
     if args_team in team_slugs:
         return args_team, team_slugs[args_team]
+    if exact:
+        emit_error(
+            "team_not_found",
+            f"No team with exact slug '{args_team}'.",
+            exit_code=EXIT_NOT_FOUND,
+        )
     matches = [(slug, name) for slug, name in team_slugs.items() if args_team.lower() in slug.lower()]
     if not matches:
         emit_error("team_not_found", f"No team matching '{args_team}'.", exit_code=EXIT_NOT_FOUND)
     if len(matches) > 1:
-        print(f"Warning: multiple teams match '{args_team}', using first match.", file=sys.stderr)
+        slugs = ", ".join(slug for slug, _ in matches)
+        emit_error(
+            "ambiguous_team",
+            f"Multiple teams match '{args_team}': {slugs}. Use an exact team slug.",
+            exit_code=EXIT_USAGE,
+        )
     return matches[0]
 
 
 def _calendar(args):
-    config = dotenv_values(CONFIG_FILE)
+    _validate_fields(args, _CALENDAR_EVENT_FIELDS, "calendar")
+    config = _load_config()
     team_filter = getattr(args, "team", None)
     limit = getattr(args, "limit", None)
-
     today = date.today()
-
     raw_since = getattr(args, "since", None)
     raw_until = getattr(args, "until", None)
-
-    if raw_since is None:
-        since = today.isoformat()
-    elif raw_since.lower() == "all":
-        since = None
-    else:
-        since = _validate_date_flag(raw_since, "--since")
-
-    if raw_until is None:
-        until = (today + timedelta(days=30)).isoformat()
-    elif raw_until.lower() == "all":
-        until = None
-    else:
-        until = _validate_date_flag(raw_until, "--until")
+    since, until = _calendar_range(raw_since, raw_until, today)
 
     session = _get_session(quiet=args.quiet)
     _progress("Fetching teams...", args.quiet)
@@ -464,11 +721,7 @@ def _calendar(args):
     output = []
     for team in teams:
         _progress(f"Fetching calendar for {team['team_slug']}...", args.quiet)
-        events = fetch_calendar_range(session, team["team_slug"], since, until)
-        events = _filter_items_since(events, since)
-        events = _filter_items_until(events, until)
-        if limit is not None:
-            events = events[:limit]
+        events = fetch_calendar_range(session, team["team_slug"], since, until, limit=limit)
         if not events:
             continue
         output.append({
@@ -477,12 +730,13 @@ def _calendar(args):
             "events": events,
         })
 
-    _output_json(output, args)
+    _output_json(output, args, _CALENDAR_EVENT_FIELDS, nested_list_key="events")
 
 
 def _event(args):
+    _validate_fields(args, _EVENT_FIELDS, "event")
     session = _get_session(args.quiet)
-    config = dotenv_values(CONFIG_FILE)
+    config = _load_config()
     club_filter = config.get("CLUB")
 
     teams = fetch_teams(session)
@@ -493,17 +747,18 @@ def _event(args):
     detail = fetch_event_detail(session, team_slug, args.id)
     detail["team"] = team_name
 
-    _output_json(detail, args)
+    _output_json(detail, args, _EVENT_FIELDS)
 
 
 def _rsvp(args):
+    _validate_fields(args, _EVENT_FIELDS, "rsvp")
     session = _get_session(args.quiet)
-    config = dotenv_values(CONFIG_FILE)
+    config = _load_config()
     club_filter = config.get("CLUB")
 
     teams = fetch_teams(session)
     teams = filter_teams_by_club(teams, club_filter)
-    team_slug, team_name = _resolve_team_slug(args.team, teams)
+    team_slug, team_name = _resolve_team_slug(args.team, teams, exact=True)
 
     _progress(f"Fetching event {args.id}...", args.quiet)
     detail = fetch_event_detail(session, team_slug, args.id)
@@ -526,11 +781,12 @@ def _rsvp(args):
             exit_code=EXIT_ERROR,
         )
 
-    _output_json(updated, args)
+    _output_json(updated, args, _EVENT_FIELDS)
 
 
 def _reset(args):
     """Remove all config, session, and state files."""
+    _validate_fields(args, _RESET_FIELDS, "reset")
     deleted = []
     failed = []
     for path in [CONFIG_FILE, SESSION_FILE, STATE_FILE]:
@@ -546,8 +802,12 @@ def _reset(args):
         for p in deleted:
             print(f"Deleted {p}", file=sys.stderr)
     if not args.quiet and not deleted and not failed:
-        print("Nothing to reset — no config or session files found.", file=sys.stderr)
-    print(json.dumps({"reset": True, "deleted": deleted, "failed": failed}))
+        print("Nothing to reset - no config or session files found.", file=sys.stderr)
+    _output_json(
+        {"reset": True, "deleted": deleted, "failed": failed},
+        args,
+        _RESET_FIELDS,
+    )
     if failed:
         sys.exit(EXIT_ERROR)
 
@@ -622,10 +882,10 @@ def main():
         "setup", help="Configure credentials and club filter",
         parents=[_global_flags],
         epilog="""non-interactive mode:
-  EMAIL=you@example.com PASSWORD=secret laget setup --no-input
+  LAGET_EMAIL=you@example.com LAGET_PASSWORD=secret laget setup --no-input
 
-  Reads credentials from EMAIL and PASSWORD environment variables.
-  Useful for CI pipelines and AI agent tool-use environments.""",
+  Reads credentials from LAGET_EMAIL and LAGET_PASSWORD environment variables.
+  Prefer interactive setup when a person is available.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children",
@@ -639,29 +899,29 @@ def main():
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
     notif_parser.add_argument("--since", help="Start date YYYY-MM-DD or 'all' (default: 30 days ago)")
     notif_parser.add_argument("--until", help="End date YYYY-MM-DD or 'all' (default: no limit)")
-    notif_parser.add_argument("--limit", type=int, help="Maximum number of results to return")
+    notif_parser.add_argument("--limit", type=_positive_int, help="Maximum number of results to return")
 
     news_parser = subparsers.add_parser("news", help="Fetch a news article with comments",
                                         parents=[_global_flags])
     news_parser.add_argument("--team", required=True, help="Team slug (or substring)")
-    news_parser.add_argument("id", help="Article ID")
+    news_parser.add_argument("id", type=_numeric_id, help="Article ID")
 
     cal_parser = subparsers.add_parser("calendar", help="List upcoming events across teams",
                                        parents=[_global_flags])
     cal_parser.add_argument("--team", help="Filter by team slug (substring match)")
-    cal_parser.add_argument("--since", help="Start date YYYY-MM-DD or 'all' (default: today)")
-    cal_parser.add_argument("--until", help="End date YYYY-MM-DD or 'all' (default: 30 days from today)")
-    cal_parser.add_argument("--limit", type=int, help="Maximum number of events per team to return")
+    cal_parser.add_argument("--since", help="Start date YYYY-MM-DD or 'all' (bounded to 1 year ago; default: today)")
+    cal_parser.add_argument("--until", help="End date YYYY-MM-DD or 'all' (bounded to 1 year ahead; default: 30 days from today)")
+    cal_parser.add_argument("--limit", type=_positive_int, help="Maximum number of events per team to return")
 
     event_parser = subparsers.add_parser("event", help="Fetch event detail",
                                          parents=[_global_flags])
     event_parser.add_argument("--team", required=True, help="Team slug (or substring)")
-    event_parser.add_argument("id", help="Event ID")
+    event_parser.add_argument("id", type=_numeric_id, help="Event ID")
 
     rsvp_parser = subparsers.add_parser("rsvp", help="RSVP yes/no to an event",
                                         parents=[_global_flags])
-    rsvp_parser.add_argument("--team", required=True, help="Team slug (or substring)")
-    rsvp_parser.add_argument("id", help="Event ID")
+    rsvp_parser.add_argument("--team", required=True, help="Exact team slug")
+    rsvp_parser.add_argument("id", type=_numeric_id, help="Event ID")
     rsvp_parser.add_argument("response", choices=["yes", "no"], help="RSVP response")
     rsvp_parser.add_argument("--comment", help="Optional RSVP comment when the event form supports comments")
 
@@ -698,7 +958,7 @@ def main():
         elif args.command == "reset":
             _reset(args)
     except KeyboardInterrupt:
-        sys.exit(130)
+        emit_error("interrupted", "Interrupted by user.", exit_code=130)
     except AuthError as e:
         emit_error("auth_failed", str(e), exit_code=EXIT_AUTH)
     except ParseError as e:
@@ -709,3 +969,14 @@ def main():
         emit_error("request_timeout", "Request timed out.", exit_code=EXIT_NETWORK)
     except requests.ConnectionError:
         emit_error("connection_failed", "Connection failed. Check your network.", exit_code=EXIT_NETWORK)
+    except requests.RequestException as e:
+        emit_error("network_error", f"Network request failed: {e}", exit_code=EXIT_NETWORK)
+    except Exception:
+        if getattr(args, "debug", False):
+            raise
+        emit_error(
+            "unexpected_error",
+            "Unexpected error. Re-run with --debug and report it at "
+            "https://github.com/daxro/laget-cli/issues.",
+            exit_code=EXIT_ERROR,
+        )

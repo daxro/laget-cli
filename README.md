@@ -1,227 +1,118 @@
 # laget-cli
 
-An unofficial CLI for [laget.se](https://www.laget.se).
+An unofficial command-line interface for [laget.se](https://www.laget.se). It uses undocumented web endpoints and may break when laget.se changes.
 
-For AI agents - make sure to read this README in full before taking action, since there are agent specific instructions (e.g. for setup).
-
-## Prerequisites
-
-- Python 3.10+
-- A laget.se account (parent or member)
+`laget-cli` is designed for people, scripts, and any software agent that can run a CLI and consume JSON.
 
 ## Install
+
+Install the latest source:
 
 ```bash
 uv tool install git+https://github.com/daxro/laget-cli.git
 ```
 
-**Development install:**
+Pin a commit for reproducible automation:
 
 ```bash
-git clone https://github.com/daxro/laget-cli.git
-cd laget-cli
-uv sync
-uv run laget --version
+uv tool install git+https://github.com/daxro/laget-cli.git@<commit-sha>
 ```
 
-## Setup
+Requires Python 3.10 or later and a laget.se account.
+
+## Secure Setup
+
+A person should run setup privately:
 
 ```bash
 laget setup
 ```
 
-Prompts for email and password, authenticates, and optionally sets a club filter to limit which teams appear.
+Setup authenticates before replacing any existing credentials or session. Credentials are stored locally with `0600` permissions.
 
-Non-interactive (pass credentials via env vars):
+Agents must never ask users to paste credentials, receive credentials, or embed credentials in commands, logs, prompts, or files. If a command returns `not_configured`, stop and ask the user to complete `laget setup` privately.
 
-```bash
-EMAIL=you@example.com PASSWORD=secret laget setup --no-input
-```
-
-For agents: do NOT run `laget setup` directly or tell the user to run it - it requires interactive input you cannot provide. Instead:
-
-1. Ask the user: "What is your laget.se email and password?"
-2. Run: `EMAIL=<email> PASSWORD=<password> laget setup --no-input -q`
-
-This applies whenever a command fails with exit code 2 and `"not_configured"` error. `--no-input` only affects `setup` - other commands never prompt for input.
-
-## Usage
+For trusted user-managed automation, a secret manager or execution environment can provide namespaced variables:
 
 ```bash
-laget status                                  # human-readable status
-laget status --json                           # machine-readable status
-laget calendar                                # upcoming events (default: next 30 days)
-laget calendar --since 2026-04-01 --until 2026-04-30
-laget calendar --team P2019 --limit 5         # filter by team, cap results
-laget event --team P2019 12345                # event detail with RSVP
-laget rsvp --team P2019 12345 yes             # RSVP yes/no to an event
-laget rsvp --team P2019 12345 no --comment "Sjuk idag"
-laget notifications                           # activity feed (default: last 30 days)
-laget notifications --since all               # all notifications, no date limit
-laget notifications --team Knatte --limit 10  # filter by team, cap results
-laget news --team P2019 67890                 # full article with comments
-laget reset                                   # remove config, session, and state files
+LAGET_EMAIL=... LAGET_PASSWORD=... laget setup --no-input -q
 ```
 
-All data commands output JSON to stdout. `laget rsvp` is a write command that updates your event RSVP before outputting JSON. Progress messages go to stderr (suppress with `-q`). Use `--fields date,type` to filter output fields, `--no-input` to prevent interactive prompts, `--debug` to log HTTP traffic.
+The legacy `EMAIL` and `PASSWORD` environment variables remain temporarily supported and emit a deprecation warning.
 
-For agents: pipe through `jq` for field extraction, e.g. `laget notifications -q | jq '.[].type'`. Use `laget status --json -q | jq '.configured'` to verify setup.
+## Agent Contract
 
-## Flags
+- Data commands emit JSON to stdout.
+- Errors emit one JSON object to stderr and use the exit codes below.
+- Progress goes to stderr. Use `-q` to suppress it.
+- Prefer bounded reads: use date ranges, `--limit`, and `--fields`.
+- `calendar` and `notifications` team filters may match multiple teams.
+- `news` and `event` accept an exact slug or a unique substring. Ambiguous matches fail.
+- `rsvp` requires an exact team slug and changes remote state.
+- `reset` deletes local credentials, session, and state.
+- `--debug` may expose sensitive HTTP details. Review debug output before sharing it.
 
-| Flag | Description |
-|------|-------------|
-| -q / --quiet | Suppress progress messages on stderr |
-| --no-input | Skip interactive prompts (setup only) |
-| --fields x,y | Filter JSON output to specific fields (e.g. --fields date,type,title) |
-| --debug | Log HTTP requests to stderr |
-| --since DATE | Start date (YYYY-MM-DD or 'all'). Notifications default: 30 days ago. Calendar default: today |
-| --until DATE | End date (YYYY-MM-DD or 'all'). Notifications default: no limit. Calendar default: 30 days from today |
-| --team SLUG | Filter by team slug (case-insensitive substring match). For news/event/rsvp, ambiguous matches use the first result |
-| --limit N | Maximum number of results to return |
-| --comment TEXT | Optional RSVP comment for `laget rsvp` when the event form supports comments |
-| --version | Show version and exit |
-| --json | Output as JSON (status only) |
+## Commands
 
-## Configuration
+```bash
+laget status --json -q
+laget notifications --since 2026-06-01 --limit 10 -q
+laget notifications --team P2019 --fields date,type,title -q
+laget calendar --until 2026-07-05 --limit 5 -q
+laget calendar --team P2019 --fields id,date,title -q
+laget news --team ExampleFC-P2019 67890 -q
+laget event --team ExampleFC-P2019 12345 -q
+laget rsvp --team ExampleFC-P2019 12345 yes -q
+laget reset -q
+```
 
-Config and state are stored in platform-standard directories (via [platformdirs](https://pypi.org/project/platformdirs/)):
+Dates must be real ISO dates in `YYYY-MM-DD` format. Calendar ranges are limited to 24 months. For calendar, `--since all` means one year ago and `--until all` means one year ahead; using both gives the bounded two-year range.
 
-| File | Linux | macOS |
-|------|-------|-------|
-| Config | `~/.config/laget/config.env` | `~/Library/Application Support/laget/config.env` |
-| Session | `~/.local/state/laget/session.json` | `~/Library/Application Support/laget/session.json` |
-| State | `~/.local/state/laget/state.json` | `~/Library/Application Support/laget/state.json` |
+`--fields` rejects unknown or empty fields. It filters notification records, event/detail/status/reset objects, and calendar event objects while preserving each calendar team envelope.
 
-Run `laget status --json` to see the actual paths on your system.
+Compact success output:
 
-Optional config variables in `config.env`:
+```json
+[{"team":"P2019","team_slug":"ExampleFC-P2019","events":[{"id":"12345","date":"2026-06-12T17:00:00","title":"Training"}]}]
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLUB` | (none) | Case-insensitive substring filter for team club names |
-| `DEFAULT_SINCE_DAYS` | `30` | Rolling window for notifications `--since` default (calendar uses today as default) |
+Error output:
+
+```json
+{"error":"ambiguous_team","message":"Multiple teams match 'P2019': ExampleFC-P2019, OtherFC-P2019. Use an exact team slug."}
+```
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | General error |
-| 2 | Invalid input / not configured |
-| 3 | Authentication error |
-| 4 | Resource not found |
-| 5 | Network error |
+| `0` | Success |
+| `1` | Unexpected or general error |
+| `2` | Invalid input or not configured |
+| `3` | Authentication error |
+| `4` | Resource not found |
+| `5` | Network error |
+| `130` | Interrupted |
 
-Errors are emitted as JSON to stderr:
+## Local Files
 
-```json
-{"error": "auth_failed", "message": "Login failed. Check your credentials."}
-```
-
-For agents: sessions expire and the CLI re-authenticates automatically on the next command. If a command fails with exit code 3, credentials may be wrong - tell the user to re-run `laget setup`.
-
-## Output
-
-Status (`laget status --json`):
-
-```json
-{
-  "configured": true,
-  "email": "use****@example.com",
-  "club_filter": "Example FC",
-  "session": "valid",
-  "teams": [
-    {"name": "P2021", "club": "Example FC", "team_slug": "ExampleFC-P2021"}
-  ],
-  "children": [
-    {"name": "Alice Testsson", "id": "1234567"}
-  ]
-}
-```
-
-Calendar:
-
-```json
-[
-  {
-    "team": "P2021",
-    "team_slug": "ExampleFC-P2021",
-    "events": [
-      {
-        "id": "12345",
-        "type": "training",
-        "title": "Traning",
-        "cancelled": false,
-        "date": "2026-04-02T17:00:00",
-        "start_time": "17:00",
-        "end_time": "18:00",
-        "location": null,
-        "assembly_time": null,
-        "location_url": null,
-        "notes": null,
-        "rsvp": null
-      }
-    ]
-  }
-]
-```
-
-RSVP (`laget rsvp --team P2019 12345 yes`):
-
-```json
-{
-  "id": "12345",
-  "team": "P2021",
-  "team_slug": "ExampleFC-P2021",
-  "type": null,
-  "title": null,
-  "cancelled": false,
-  "date": null,
-  "start_time": null,
-  "end_time": null,
-  "assembly_time": null,
-  "location": "Sporthallen",
-  "location_url": null,
-  "notes": null,
-  "rsvp": {
-    "yes": null,
-    "no": null,
-    "unanswered": null,
-    "my_response": "yes",
-    "url": "https://www.laget.se/ExampleFC-P2021/Rsvp/12345/1234567"
-  },
-  "responses": []
-}
-```
-
-Notifications:
-
-```json
-[
-  {
-    "date": "2026-03-29T18:45:00",
-    "type": "guestbook",
-    "author": "Bob Testsson",
-    "title": "Skrev i gastboken",
-    "team": "P2021",
-    "team_slug": "ExampleFC-P2021",
-    "url": "/ExampleFC-P2021/Guestbook"
-  }
-]
-```
-
-Notification types: `news`, `news_comment`, `guestbook`, `rsvp`, `unknown`.
+Run `laget status --json` to see the actual config and session paths for the current platform. Config, session, and state files are written atomically with `0600` permissions.
 
 ## Uninstall
 
 ```bash
-laget reset -q                             # remove config, session, and state
-uv tool uninstall laget-cli                # remove the binary
+laget reset -q
+uv tool uninstall laget-cli
 ```
 
-## Testing
+## Development
 
 ```bash
+git clone https://github.com/daxro/laget-cli.git
+cd laget-cli
+uv sync --locked --all-groups
 uv run pytest
+uv build
 ```
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting.

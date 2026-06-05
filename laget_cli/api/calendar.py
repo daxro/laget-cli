@@ -33,20 +33,31 @@ def fetch_calendar(session, team_slug, year, month):
     return _parse_calendar_month(resp.text, year, month)
 
 
-def fetch_calendar_range(session, team_slug, start_date, end_date):
+def fetch_calendar_range(session, team_slug, start_date, end_date, limit=None):
     """Fetch calendar events across a date range, spanning multiple months if needed.
 
     Args:
         session: authenticated requests.Session
         team_slug: team URL slug
-        start_date: ISO date string "YYYY-MM-DD" or None (defaults to 1 year ago)
-        end_date: ISO date string "YYYY-MM-DD" or None (defaults to 1 year from now)
+        start_date: ISO date string "YYYY-MM-DD" or None
+        end_date: ISO date string "YYYY-MM-DD" or None
+        limit: maximum number of events to return
 
     Returns a deduplicated, sorted list of event dicts.
     """
     today = date.today()
-    start = date.fromisoformat(start_date) if start_date else today.replace(year=today.year - 1)
-    end = date.fromisoformat(end_date) if end_date else today.replace(year=today.year + 1)
+    try:
+        previous_year = today.replace(year=today.year - 1)
+    except ValueError:
+        previous_year = today.replace(year=today.year - 1, day=28)
+    try:
+        default_end = today.replace(year=today.year + 1)
+    except ValueError:
+        default_end = today.replace(year=today.year + 1, day=28)
+    start = date.fromisoformat(start_date) if start_date else previous_year if end_date else today
+    end = date.fromisoformat(end_date) if end_date else default_end
+    if start > end:
+        raise ValueError("calendar start date must be on or before end date")
 
     # Build list of (year, month) pairs to fetch
     months = []
@@ -54,6 +65,8 @@ def fetch_calendar_range(session, team_slug, start_date, end_date):
     current_month = start.month
     while (current_year, current_month) <= (end.year, end.month):
         months.append((current_year, current_month))
+        if len(months) > 24:
+            raise ValueError("calendar date range may span at most 24 months")
         current_month += 1
         if current_month > 12:
             current_month = 1
@@ -64,9 +77,16 @@ def fetch_calendar_range(session, team_slug, start_date, end_date):
     for year, month in months:
         events = fetch_calendar(session, team_slug, year, month)
         for event in events:
+            event_date = event["date"][:10]
+            if event_date < start.isoformat() or event_date > end.isoformat():
+                continue
             if event["id"] not in seen_ids:
                 seen_ids.add(event["id"])
                 all_events.append(event)
+                if limit is not None and len(all_events) >= limit:
+                    break
+        if limit is not None and len(all_events) >= limit:
+            break
 
     all_events.sort(key=lambda e: e["date"])
     return all_events

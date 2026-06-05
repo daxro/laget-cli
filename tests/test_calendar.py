@@ -1,6 +1,7 @@
 """Tests for laget_cli.api.calendar."""
 
 import json
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -685,6 +686,23 @@ class TestFetchCalendarRange:
         dates = [e["date"] for e in events]
         assert dates == sorted(dates)
 
+    def test_limit_stops_fetching_more_months(self):
+        session = self._make_session({3: CALENDAR_MULTI_EVENT_DAY_HTML, 4: CALENDAR_MONTH_HTML})
+        events = fetch_calendar_range(
+            session,
+            "TeamAlpha-P2021",
+            "2026-03-01",
+            "2026-04-30",
+            limit=1,
+        )
+        assert len(events) == 1
+        assert session.get.call_count == 1
+
+    def test_range_over_24_months_is_rejected(self):
+        session = self._make_session({})
+        with pytest.raises(ValueError, match="at most 24 months"):
+            fetch_calendar_range(session, "TeamAlpha-P2021", "2024-01-01", "2026-01-01")
+
 
 # ---------------------------------------------------------------------------
 # fetch_event_detail tests
@@ -757,10 +775,11 @@ class TestCalendarCommand:
         assert result == []
 
     def test_non_empty_output_has_team_structure(self):
+        event_date = (date.today() + timedelta(days=1)).isoformat()
         events = [
             {
                 "id": "123", "type": "training", "title": "Träning",
-                "cancelled": False, "date": "2026-06-01T10:00:00",
+                "cancelled": False, "date": f"{event_date}T10:00:00",
                 "start_time": "10:00", "end_time": "11:00",
                 "location": None, "assembly_time": None, "location_url": None,
                 "notes": None, "rsvp": None,
@@ -795,6 +814,20 @@ class TestCalendarCommand:
         # Only TeamAlpha team should be in output (TeamBeta filtered out before fetch)
         team_slugs = [r["team_slug"] for r in result]
         assert all("TeamAlpha" in slug for slug in team_slugs)
+
+    def test_fields_filter_events_and_preserve_team_envelope(self):
+        events = [
+            {
+                "id": "123", "type": "training", "title": "Träning",
+                "cancelled": False, "date": "2026-07-01T10:00:00",
+                "start_time": "10:00", "end_time": "11:00",
+                "location": None, "assembly_time": None, "location_url": None,
+                "notes": None, "rsvp": None,
+            }
+        ]
+        result = self._run(["calendar", "--fields", "date,type"], events_data=events)
+        assert set(result[0]) == {"team", "team_slug", "events"}
+        assert set(result[0]["events"][0]) == {"date", "type"}
 
 
 class TestEventCommand:
@@ -900,6 +933,11 @@ class TestRsvpCommand:
     def test_fields_filters_output(self):
         result, _ = self._run(["rsvp", "--team", "TeamAlpha-P2021", "29705518", "yes", "--fields", "id,rsvp"])
         assert set(result.keys()) == {"id", "rsvp"}
+
+    def test_requires_exact_team_slug(self):
+        with pytest.raises(SystemExit) as exc:
+            self._run(["rsvp", "--team", "TeamAlpha", "29705518", "yes"])
+        assert exc.value.code == 4
 
     def test_unknown_team_exits_4(self):
         with pytest.raises(SystemExit) as exc:

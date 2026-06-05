@@ -1,3 +1,4 @@
+import argparse
 import json
 from datetime import date, timedelta
 from unittest.mock import patch
@@ -8,9 +9,13 @@ from laget_cli.cli import (
     _filter_by_team,
     _filter_items_since,
     _filter_items_until,
+    _calendar_range,
+    _numeric_id,
+    _positive_int,
     _resolve_since,
     _resolve_until,
     _validate_date_flag,
+    _validate_date_range,
 )
 
 
@@ -37,6 +42,51 @@ class TestValidateDateFlag:
         err = json.loads(capsys.readouterr().err)
         assert err["error"] == "invalid_input"
         assert "--since" in err["message"]
+
+    def test_impossible_date_exits(self):
+        with pytest.raises(SystemExit) as exc:
+            _validate_date_flag("2024-02-30", "--since")
+        assert exc.value.code == 2
+
+
+class TestValidateDateRange:
+    def test_rejects_reversed_range(self):
+        with pytest.raises(SystemExit) as exc:
+            _validate_date_range("2026-04-02", "2026-04-01")
+        assert exc.value.code == 2
+
+    def test_allows_open_range(self):
+        _validate_date_range(None, "2026-04-01")
+        _validate_date_range("2026-04-01", None)
+
+
+class TestCalendarRange:
+    def test_all_is_leap_safe_and_bounded(self):
+        since, until = _calendar_range("all", "all", date(2024, 2, 29))
+        assert since == "2023-02-28"
+        assert until == "2025-01-31"
+
+    def test_rejects_more_than_24_months(self):
+        with pytest.raises(SystemExit) as exc:
+            _calendar_range("2024-01-01", "2026-01-01", date(2025, 1, 1))
+        assert exc.value.code == 2
+
+
+class TestParserTypes:
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_positive_int_rejects_invalid_values(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int(value)
+
+    def test_positive_int_accepts_positive_value(self):
+        assert _positive_int("3") == 3
+
+    def test_numeric_id_rejects_non_digits(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _numeric_id("../123")
+
+    def test_numeric_id_preserves_digits(self):
+        assert _numeric_id("00123") == "00123"
 
 
 class TestResolveSince:

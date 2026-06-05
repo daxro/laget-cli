@@ -5,12 +5,12 @@ import json
 import os
 import re
 from html import unescape
-from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 
 from laget_cli.errors import AuthError
+from laget_cli.paths import atomic_write_text
 
 AJAX_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 BASE_URL = "https://www.laget.se"
@@ -60,7 +60,6 @@ def parse_hidden_fields(html):
 
 def save_session(session, path="session.json"):
     """Save session cookies to a JSON file."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
     cookies = []
     for c in session.cookies:
         cookies.append({
@@ -71,9 +70,7 @@ def save_session(session, path="session.json"):
             "secure": c.secure,
             "httponly": "HttpOnly" in c._rest,
         })
-    with open(path, "w") as f:
-        json.dump(cookies, f, indent=2)
-    os.chmod(path, 0o600)
+    atomic_write_text(path, json.dumps(cookies, indent=2))
 
 
 def load_session(session, path="session.json"):

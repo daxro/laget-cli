@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "laget-cli"
 version = "0.1.0"
+description = "An unofficial, agent-friendly CLI for laget.se."
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31.0",
@@ -17,6 +20,11 @@ completion = ["argcomplete>=3.0"]
 
 [project.scripts]
 laget = "laget_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/daxro/laget-cli"
+Repository = "https://github.com/daxro/laget-cli"
+Issues = "https://github.com/daxro/laget-cli/issues"
 
 [dependency-groups]
 dev = [

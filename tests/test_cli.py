@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from laget_cli.cli import _mask_email, _progress, _use_color, main, print_logo
+from laget_cli.errors import AuthError
 
 
 class TestMaskEmail:
@@ -138,11 +139,12 @@ class TestNotificationsLimit:
 
 
 class TestStatusCommand:
+    @patch("laget_cli.cli._sync_state", return_value={"child_teams": {}})
     @patch("laget_cli.cli.fetch_children")
     @patch("laget_cli.cli.fetch_teams")
     @patch("laget_cli.cli.login")
     @patch("laget_cli.cli.dotenv_values")
-    def test_status_json_outputs_json(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, capsys):
+    def test_status_json_outputs_json(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, mock_sync, capsys):
         mock_dotenv.return_value = {"EMAIL": "user@example.com", "PASSWORD": "pass", "CLUB": "Test FK"}
         mock_login.return_value = MagicMock()
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
@@ -158,11 +160,12 @@ class TestStatusCommand:
         assert len(output["teams"]) == 1
         assert len(output["children"]) == 1
 
+    @patch("laget_cli.cli._sync_state", return_value={"child_teams": {}})
     @patch("laget_cli.cli.fetch_children")
     @patch("laget_cli.cli.fetch_teams")
     @patch("laget_cli.cli.login")
     @patch("laget_cli.cli.dotenv_values")
-    def test_status_human_readable(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, capsys):
+    def test_status_human_readable(self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, mock_sync, capsys):
         mock_dotenv.return_value = {"EMAIL": "user@example.com", "PASSWORD": "pass", "CLUB": "Test FK"}
         mock_login.return_value = MagicMock()
         mock_fetch_teams.return_value = [{"name": "T1", "club": "Test FK", "team_slug": "a"}]
@@ -295,24 +298,66 @@ class TestPrintLogo:
 
 
 class TestSetupCommand:
+    @patch("laget_cli.cli.print_logo")
     @patch("laget_cli.cli.dotenv_values")
-    def test_setup_calls_print_logo(self, mock_dotenv, capsys):
-        """setup command should call print_logo(), not reference _LOGO."""
-        mock_dotenv.return_value = {}
-
+    def test_interactive_setup_calls_print_logo(self, mock_dotenv, mock_logo):
+        mock_dotenv.return_value = {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}
         mock_stdin = MagicMock()
-        mock_stdin.isatty.return_value = False
+        mock_stdin.isatty.return_value = True
         with patch("sys.argv", ["laget", "setup"]):
-            with patch("sys.stdin", mock_stdin):
-                with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
-                    with patch("laget_cli.cli.login") as mock_login:
-                        mock_login.return_value = MagicMock()
-                        with patch("laget_cli.cli._get_status", return_value={"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": [], "config_path": "/tmp/config.env", "session_path": "/tmp/session.json"}):
-                            main()
+            with patch("sys.stdin", mock_stdin), \
+                 patch("builtins.input", return_value="n"), \
+                 patch("laget_cli.cli.login"):
+                main()
 
-        err = capsys.readouterr().err
-        # Should contain the logo ASCII art, not crash with NameError
-        assert "___ _" in err or "laget" in err or "|___/" in err
+        mock_logo.assert_called_once_with()
+
+    @patch("laget_cli.cli._print_status")
+    @patch("laget_cli.cli._get_status", return_value={})
+    @patch("laget_cli.cli._persist_setup")
+    @patch("laget_cli.cli.fetch_teams")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli.print_logo")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_interactive_default_clears_existing_club_filter(
+        self,
+        mock_dotenv,
+        mock_logo,
+        mock_login,
+        mock_teams,
+        mock_persist,
+        _mock_status,
+        _mock_print,
+    ):
+        from laget_cli.cli import _setup
+
+        mock_dotenv.return_value = {
+            "LAGET_EMAIL": "old@example.com",
+            "LAGET_PASSWORD": "old",
+            "CLUB": "Old Club",
+        }
+        mock_login.return_value = MagicMock()
+        mock_teams.return_value = [
+            {"name": "A", "club": "Club A", "team_slug": "club-a"},
+            {"name": "B", "club": "Club B", "team_slug": "club-b"},
+        ]
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = True
+
+        with patch("sys.stdin", mock_stdin), \
+             patch("builtins.input", side_effect=["y", "new@example.com", ""]), \
+             patch("laget_cli.cli.getpass.getpass", return_value="new"):
+            args = MagicMock(no_input=False, quiet=True, fields=None)
+            _setup(args)
+
+        mock_persist.assert_called_once_with(
+            "new@example.com",
+            "new",
+            None,
+            mock_login.return_value,
+            reset_state=True,
+        )
+        mock_logo.assert_called_once_with()
 
 
 class TestSignalHandling:
@@ -333,26 +378,38 @@ class TestSignalHandling:
         err = capsys.readouterr().err
         assert "Traceback" not in err
 
+    def test_keyboard_interrupt_emits_structured_error(self, capsys):
+        with patch("sys.argv", ["laget", "notifications"]):
+            with patch("laget_cli.cli._notifications", side_effect=KeyboardInterrupt):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+        assert exc.value.code == 130
+        assert json.loads(capsys.readouterr().err)["error"] == "interrupted"
+
 
 class TestSetupNoInput:
     @patch("laget_cli.cli._get_status")
     @patch("laget_cli.cli.login")
-    @patch("laget_cli.cli._write_env")
+    @patch("laget_cli.cli._persist_setup")
     @patch("laget_cli.cli.print_logo")
     @patch("laget_cli.cli.dotenv_values")
-    def test_no_input_flag_skips_prompts(self, mock_dotenv, mock_logo, mock_write_env, mock_login, mock_status, capsys):
+    def test_no_input_flag_skips_prompts(self, mock_dotenv, mock_logo, mock_persist, mock_login, mock_status, capsys):
         mock_dotenv.return_value = {}
         mock_login.return_value = MagicMock()
         mock_status.return_value = {"configured": True, "email": "t****@t.com", "session": "valid", "club_filter": None, "teams": [], "children": [], "config_path": "/tmp/config.env", "session_path": "/tmp/session.json"}
 
-        with patch.dict("os.environ", {"EMAIL": "t@t.com", "PASSWORD": "pw"}):
+        with patch.dict("os.environ", {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}):
             with patch("sys.argv", ["laget", "-q", "setup", "--no-input"]):
                 # stdin IS a tty, but --no-input should override
                 with patch("sys.stdin") as mock_stdin:
                     mock_stdin.isatty.return_value = True
                     main()
 
-        mock_write_env.assert_called_once_with("t@t.com", "pw")
+        mock_persist.assert_called_once_with(
+            "t@t.com", "pw", None, mock_login.return_value, reset_state=True
+        )
+        mock_login.assert_called_once_with("t@t.com", "pw", session_path=None)
+        mock_logo.assert_not_called()
 
     @patch("laget_cli.cli.print_logo")
     @patch("laget_cli.cli.dotenv_values")
@@ -360,12 +417,56 @@ class TestSetupNoInput:
         mock_dotenv.return_value = {}
 
         with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("LAGET_EMAIL", None)
+            os.environ.pop("LAGET_PASSWORD", None)
             os.environ.pop("EMAIL", None)
             os.environ.pop("PASSWORD", None)
             with patch("sys.argv", ["laget", "setup", "--no-input"]):
                 with pytest.raises(SystemExit) as exc:
                     main()
                 assert exc.value.code == 2
+        mock_logo.assert_not_called()
+        assert json.loads(capsys.readouterr().err)["error"] == "setup_required"
+
+    @patch("laget_cli.cli._get_status")
+    @patch("laget_cli.cli.login")
+    @patch("laget_cli.cli._persist_setup")
+    @patch("laget_cli.cli.print_logo")
+    @patch("laget_cli.cli.dotenv_values")
+    def test_new_account_clears_existing_club_filter(
+        self, mock_dotenv, mock_logo, mock_persist, mock_login, mock_status
+    ):
+        mock_dotenv.return_value = {
+            "LAGET_EMAIL": "old@example.com",
+            "LAGET_PASSWORD": "old",
+            "CLUB": "Old Club",
+        }
+        mock_login.return_value = MagicMock()
+        mock_status.return_value = {
+            "configured": True,
+            "email": "new****@example.com",
+            "session": "valid",
+            "club_filter": None,
+            "teams": [],
+            "children": [],
+            "config_path": "/tmp/config.env",
+            "session_path": "/tmp/session.json",
+        }
+
+        with patch.dict(
+            "os.environ",
+            {"LAGET_EMAIL": "new@example.com", "LAGET_PASSWORD": "new"},
+        ), patch("sys.argv", ["laget", "setup", "--no-input", "-q"]):
+            main()
+
+        mock_persist.assert_called_once_with(
+            "new@example.com",
+            "new",
+            None,
+            mock_login.return_value,
+            reset_state=True,
+        )
+        mock_logo.assert_not_called()
 
 
 class TestGlobalFlagPosition:
@@ -575,3 +676,249 @@ class TestResetCommand:
         data = json.loads(captured.out)
         assert len(data["failed"]) == 1
         assert "Failed to delete" in captured.err
+
+
+class TestAgentSafetyContracts:
+    def test_get_session_does_not_sync_state(self):
+        from laget_cli.cli import _get_session
+
+        with patch("laget_cli.cli.dotenv_values", return_value={"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}), \
+             patch("laget_cli.cli.login", return_value=MagicMock()) as mock_login, \
+             patch("laget_cli.cli.sync_child_team_mapping") as mock_sync:
+            _get_session(quiet=True)
+
+        mock_login.assert_called_once()
+        mock_sync.assert_not_called()
+
+    def test_status_fetches_once_and_syncs_explicitly(self):
+        from laget_cli.cli import _get_status
+
+        session = MagicMock()
+        teams = [{"name": "P2021", "club": "Club", "team_slug": "Club-P2021"}]
+        children = [{"name": "Alice", "id": "123"}]
+        state = {"child_teams": {"123": {"team_slug": "Club-P2021", "team_name": "P2021"}}}
+        config = {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}
+
+        with patch("laget_cli.cli.fetch_teams", return_value=teams) as mock_teams, \
+             patch("laget_cli.cli.fetch_children", return_value=children) as mock_children, \
+             patch("laget_cli.cli._sync_state", return_value=state) as mock_sync:
+            status = _get_status(session=session, config=config)
+
+        mock_teams.assert_called_once_with(session)
+        mock_children.assert_called_once_with(session)
+        mock_sync.assert_called_once_with(session, config, teams=teams, children=children, quiet=True)
+        assert status["children"][0]["team_slug"] == "Club-P2021"
+
+    def test_status_successful_empty_sync_does_not_load_stale_state(self):
+        from laget_cli.cli import _get_status
+
+        config = {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}
+        with patch("laget_cli.cli.fetch_teams", return_value=[]), \
+             patch("laget_cli.cli.fetch_children", return_value=[]) as mock_children, \
+             patch("laget_cli.cli._sync_state", return_value={"child_teams": {}}) as mock_sync, \
+             patch("laget_cli.cli._load_state") as mock_load:
+            status = _get_status(session=MagicMock(), config=config)
+
+        mock_children.assert_called_once()
+        mock_sync.assert_called_once()
+        mock_load.assert_not_called()
+        assert status["teams"] == []
+        assert status["children"] == []
+
+    def test_ambiguous_single_resource_team_exits_usage(self, capsys):
+        from laget_cli.cli import _resolve_team_slug
+
+        teams = [
+            {"name": "A", "team_slug": "Club-A"},
+            {"name": "B", "team_slug": "Club-B"},
+        ]
+        with pytest.raises(SystemExit) as exc:
+            _resolve_team_slug("Club", teams)
+        assert exc.value.code == 2
+        assert json.loads(capsys.readouterr().err)["error"] == "ambiguous_team"
+
+    def test_unknown_fields_fail_before_network(self, capsys):
+        with patch("laget_cli.cli._get_session") as mock_session:
+            with patch("sys.argv", ["laget", "notifications", "--fields", "bogus"]):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+        assert exc.value.code == 2
+        mock_session.assert_not_called()
+        assert json.loads(capsys.readouterr().err)["error"] == "invalid_input"
+
+    def test_setup_authenticates_before_persisting_and_redacts_password(self, capsys):
+        secret = "do-not-print-this"
+        with patch("laget_cli.cli.dotenv_values", return_value={}), \
+             patch("laget_cli.cli.print_logo"), \
+             patch("laget_cli.cli.login", side_effect=AuthError("Login failed")), \
+             patch("laget_cli.cli._persist_setup") as mock_persist, \
+             patch.dict("os.environ", {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": secret}):
+            with patch("sys.argv", ["laget", "setup", "--no-input"]):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+        assert exc.value.code == 3
+        mock_persist.assert_not_called()
+        captured = capsys.readouterr()
+        assert secret not in captured.out
+        assert secret not in captured.err
+
+    def test_persist_setup_restores_previous_config_when_session_save_fails(self, tmp_path):
+        from laget_cli.cli import _persist_setup
+
+        config = tmp_path / "config.env"
+        session_path = tmp_path / "session.json"
+        original = 'LAGET_EMAIL="old@example.com"\nLAGET_PASSWORD="old"\n'
+        config.write_text(original)
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session_path), \
+             patch("laget_cli.cli.save_session", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                _persist_setup("new@example.com", "new", None, MagicMock())
+
+        assert config.read_text() == original
+        assert not session_path.exists()
+
+    def test_persist_setup_restores_previous_session_when_save_fails_after_replace(self, tmp_path):
+        from laget_cli.cli import _persist_setup
+
+        config = tmp_path / "config.env"
+        session_path = tmp_path / "session.json"
+        original_config = 'LAGET_EMAIL="old@example.com"\nLAGET_PASSWORD="old"\n'
+        original_session = '[{"name": "old"}]'
+        config.write_text(original_config)
+        session_path.write_text(original_session)
+
+        def replace_then_fail(_session, path):
+            path.write_text('[{"name": "new"}]')
+            raise OSError("disk full")
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session_path), \
+             patch("laget_cli.cli.save_session", side_effect=replace_then_fail):
+            with pytest.raises(OSError):
+                _persist_setup("new@example.com", "new", None, MagicMock())
+
+        assert config.read_text() == original_config
+        assert session_path.read_text() == original_session
+        assert config.stat().st_mode & 0o777 == 0o600
+        assert session_path.stat().st_mode & 0o777 == 0o600
+
+    def test_account_switch_invalidates_previous_state_before_failed_sync(self, tmp_path):
+        from laget_cli.cli import _get_status, _persist_setup
+
+        config = tmp_path / "config.env"
+        session_path = tmp_path / "session.json"
+        state = tmp_path / "state.json"
+        state.write_text(
+            json.dumps({
+                "child_teams": {
+                    "123": {"team_slug": "Old-Club", "team_name": "Old Club"}
+                }
+            })
+        )
+
+        with patch("laget_cli.cli.CONFIG_FILE", config), \
+             patch("laget_cli.cli.SESSION_FILE", session_path), \
+             patch("laget_cli.cli.STATE_FILE", state), \
+             patch("laget_cli.cli.save_session"):
+            _persist_setup(
+                "new@example.com",
+                "new",
+                None,
+                MagicMock(),
+                reset_state=True,
+            )
+            with patch("laget_cli.cli.fetch_teams", side_effect=requests.ConnectionError()), \
+                 patch("laget_cli.cli.fetch_children", side_effect=requests.ConnectionError()):
+                status = _get_status(
+                    session=MagicMock(),
+                    config={"LAGET_EMAIL": "new@example.com", "LAGET_PASSWORD": "new"},
+                )
+
+        assert json.loads(state.read_text()) == {"child_teams": {}}
+        assert status["teams"] == []
+        assert status["children"] == []
+        assert state.stat().st_mode & 0o777 == 0o600
+
+    def test_config_and_state_files_are_private(self, tmp_path):
+        from laget_cli.cli import _sync_state, _write_env
+
+        config = tmp_path / "config.env"
+        state = tmp_path / "state.json"
+        teams = [{"name": "P2021", "club": "Club", "team_slug": "Club-P2021"}]
+        children = [{"name": "Alice", "id": "123"}]
+
+        with patch("laget_cli.cli.CONFIG_FILE", config):
+            _write_env("t@t.com", "pw")
+        with patch("laget_cli.cli.STATE_FILE", state), \
+             patch("laget_cli.cli.sync_child_team_mapping", return_value={"123": "Club-P2021"}):
+            _sync_state(MagicMock(), {}, teams=teams, children=children, quiet=True)
+
+        assert config.stat().st_mode & 0o777 == 0o600
+        assert state.stat().st_mode & 0o777 == 0o600
+
+    def test_config_credentials_round_trip_without_interpolation(self, tmp_path):
+        from laget_cli.cli import _load_config, _write_env
+
+        config = tmp_path / "config.env"
+        password = r'abc${HOME}\quoted"value'
+
+        with patch("laget_cli.cli.CONFIG_FILE", config):
+            _write_env("t@t.com", password)
+            loaded = _load_config()
+
+        assert loaded["LAGET_PASSWORD"] == password
+
+    def test_legacy_environment_credentials_warn(self, capsys):
+        from laget_cli.cli import _credentials_from_mapping
+
+        with patch("laget_cli.cli._legacy_credentials_warned", False):
+            assert _credentials_from_mapping(
+                {"EMAIL": "t@t.com", "PASSWORD": "pw"},
+                "the environment",
+                warn_legacy=True,
+            ) == ("t@t.com", "pw")
+        assert "deprecated" in capsys.readouterr().err
+
+    def test_legacy_config_does_not_break_structured_error(self, capsys):
+        with patch("laget_cli.cli._legacy_credentials_warned", False), \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "pw"}), \
+             patch("laget_cli.cli.login", side_effect=AuthError("Login failed")):
+            with patch("sys.argv", ["laget", "status", "--json", "-q"]):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+
+        assert exc.value.code == 3
+        assert json.loads(capsys.readouterr().err)["error"] == "auth_failed"
+
+    def test_legacy_environment_warning_is_quiet(self, capsys):
+        from laget_cli.cli import _credentials_from_mapping
+
+        with patch("laget_cli.cli._legacy_credentials_warned", False):
+            _credentials_from_mapping(
+                {"EMAIL": "t@t.com", "PASSWORD": "pw"},
+                "the environment",
+                warn_legacy=True,
+                quiet=True,
+            )
+        assert capsys.readouterr().err == ""
+
+
+class TestUnexpectedErrors:
+    def test_unexpected_error_is_structured_without_debug(self, capsys):
+        with patch("sys.argv", ["laget", "notifications"]), \
+             patch("laget_cli.cli._notifications", side_effect=RuntimeError("internal detail")):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 1
+        error = json.loads(capsys.readouterr().err)
+        assert error["error"] == "unexpected_error"
+        assert "internal detail" not in error["message"]
+
+    def test_debug_reraises_unexpected_error(self, capsys):
+        with patch("sys.argv", ["laget", "--debug", "notifications"]), \
+             patch("laget_cli.cli._notifications", side_effect=RuntimeError("internal detail")):
+            with pytest.raises(RuntimeError, match="internal detail"):
+                main()
+        assert "sensitive data" in capsys.readouterr().err
