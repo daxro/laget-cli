@@ -12,6 +12,12 @@ Install the latest source:
 uv tool install git+https://github.com/daxro/laget-cli.git
 ```
 
+Update an existing install:
+
+```bash
+uv tool upgrade laget-cli
+```
+
 Pin a commit for reproducible automation:
 
 ```bash
