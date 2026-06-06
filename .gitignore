@@ -1,12 +1,19 @@
+# Local OS/editor files
 .DS_Store
+
+# Local environment
 .env*
 !.env.example
+.venv/
+
+# Python artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
-.venv/
+
+# Tool caches and reports
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -14,5 +21,7 @@ build/
 .nox/
 .coverage
 htmlcov/
+
+# Agent/local scratch space
 _temp_inbox/
 .playwright-mcp/
