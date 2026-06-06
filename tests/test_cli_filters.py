@@ -18,6 +18,14 @@ from laget_cli.cli import (
     _validate_date_range,
 )
 
+FROZEN_TODAY = date(2026, 6, 15)
+
+
+class FrozenDate(date):
+    @classmethod
+    def today(cls):
+        return cls(FROZEN_TODAY.year, FROZEN_TODAY.month, FROZEN_TODAY.day)
+
 
 class TestValidateDateFlag:
     def test_valid_date_passes_through(self):
@@ -100,12 +108,12 @@ class TestResolveSince:
 
     def test_default_since_days_from_config(self):
         config = {"DEFAULT_SINCE_DAYS": "7"}
-        expected = (date.today() - timedelta(days=7)).isoformat()
-        assert _resolve_since(None, config) == expected
+        with patch("laget_cli.cli.date", FrozenDate):
+            assert _resolve_since(None, config) == "2026-06-08"
 
     def test_default_30_days_when_no_config(self):
-        expected = (date.today() - timedelta(days=30)).isoformat()
-        assert _resolve_since(None, {}) == expected
+        with patch("laget_cli.cli.date", FrozenDate):
+            assert _resolve_since(None, {}) == "2026-05-16"
 
     def test_invalid_default_since_days_exits(self, capsys):
         with pytest.raises(SystemExit) as exc:

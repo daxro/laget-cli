@@ -6,6 +6,7 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 import requests.cookies
+import pytest
 
 from laget_cli.session import (
     follow_redirects,
@@ -102,11 +103,8 @@ class TestVerifyAuthenticated:
         resp.headers = {"Location": "https://www.laget.se/login"}
         session.get.return_value = resp
 
-        try:
+        with pytest.raises(AuthError, match="expired|redirect"):
             verify_authenticated(session)
-            assert False, "Should have raised AuthError"
-        except AuthError as e:
-            assert "expired" in str(e).lower() or "redirect" in str(e).lower()
 
     def test_non_200_raises_auth_error(self):
         session = MagicMock()
@@ -114,11 +112,8 @@ class TestVerifyAuthenticated:
         resp.status_code = 500
         session.get.return_value = resp
 
-        try:
+        with pytest.raises(AuthError):
             verify_authenticated(session)
-            assert False, "Should have raised AuthError"
-        except AuthError:
-            pass
 
     def test_non_json_raises_auth_error(self):
         session = MagicMock()
@@ -127,11 +122,8 @@ class TestVerifyAuthenticated:
         resp.json.side_effect = ValueError("not json")
         session.get.return_value = resp
 
-        try:
+        with pytest.raises(AuthError):
             verify_authenticated(session)
-            assert False, "Should have raised AuthError"
-        except AuthError:
-            pass
 
 
 class TestSessionPersistence:
@@ -266,11 +258,8 @@ class TestLogin:
         resp.text = "<html>No hidden fields</html>"
         session.get.return_value = resp
 
-        try:
+        with pytest.raises(AuthError, match="CSRF"):
             login("test@example.com", "pass", session_path=None, _session=session)
-            assert False, "Should have raised AuthError"
-        except AuthError as e:
-            assert "CSRF" in str(e)
 
     def test_login_reuses_saved_session(self):
         """If saved session is valid, skip login."""

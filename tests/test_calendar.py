@@ -23,6 +23,15 @@ from laget_cli.api.calendar import (
 from laget_cli.errors import ParseError
 
 
+FROZEN_TODAY = date(2026, 3, 15)
+
+
+class FrozenDate(date):
+    @classmethod
+    def today(cls):
+        return cls(FROZEN_TODAY.year, FROZEN_TODAY.month, FROZEN_TODAY.day)
+
+
 # ---------------------------------------------------------------------------
 # HTML fixtures - calendar list view
 # ---------------------------------------------------------------------------
@@ -775,7 +784,7 @@ class TestCalendarCommand:
         assert result == []
 
     def test_non_empty_output_has_team_structure(self):
-        event_date = (date.today() + timedelta(days=1)).isoformat()
+        event_date = "2026-03-16"
         events = [
             {
                 "id": "123", "type": "training", "title": "Träning",
@@ -969,26 +978,66 @@ class TestRsvpCommand:
 # ---------------------------------------------------------------------------
 
 class TestFetchCalendarRangeNone:
-    def test_none_start_uses_reasonable_default(self):
-        """fetch_calendar_range with None start_date should not crash."""
+    def test_none_start_uses_previous_year_months(self):
         session = MagicMock()
         resp = MagicMock()
         resp.text = CALENDAR_EMPTY_HTML
         resp.raise_for_status = MagicMock()
         session.get.return_value = resp
 
-        events = fetch_calendar_range(session, "TeamAlpha-P2021", None, "2026-04-30")
-        assert isinstance(events, list)
+        with patch("laget_cli.api.calendar.date", FrozenDate):
+            fetch_calendar_range(session, "TeamAlpha-P2021", None, "2026-04-30")
 
-    def test_none_end_uses_reasonable_default(self):
+        requested_months = [
+            (call.kwargs["params"]["year"], call.kwargs["params"]["month"])
+            for call in session.get.call_args_list
+        ]
+        assert requested_months == [
+            (2025, 3),
+            (2025, 4),
+            (2025, 5),
+            (2025, 6),
+            (2025, 7),
+            (2025, 8),
+            (2025, 9),
+            (2025, 10),
+            (2025, 11),
+            (2025, 12),
+            (2026, 1),
+            (2026, 2),
+            (2026, 3),
+            (2026, 4),
+        ]
+
+    def test_none_end_uses_next_year_months(self):
         session = MagicMock()
         resp = MagicMock()
         resp.text = CALENDAR_EMPTY_HTML
         resp.raise_for_status = MagicMock()
         session.get.return_value = resp
 
-        events = fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-01", None)
-        assert isinstance(events, list)
+        with patch("laget_cli.api.calendar.date", FrozenDate):
+            fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-01", None)
+
+        requested_months = [
+            (call.kwargs["params"]["year"], call.kwargs["params"]["month"])
+            for call in session.get.call_args_list
+        ]
+        assert requested_months == [
+            (2026, 3),
+            (2026, 4),
+            (2026, 5),
+            (2026, 6),
+            (2026, 7),
+            (2026, 8),
+            (2026, 9),
+            (2026, 10),
+            (2026, 11),
+            (2026, 12),
+            (2027, 1),
+            (2027, 2),
+            (2027, 3),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -996,9 +1045,9 @@ class TestFetchCalendarRangeNone:
 # ---------------------------------------------------------------------------
 
 class TestCalendarSinceAll:
-    """Regression tests for --since all / --until all (previously crashed with TypeError)."""
+    """Regression tests for bounded --since all / --until all ranges."""
 
-    def _run(self, argv, events_data=None, teams_data=None):
+    def _run_and_capture_range(self, argv, events_data=None, teams_data=None):
         from io import StringIO
         from laget_cli.cli import main
 
@@ -1007,24 +1056,36 @@ class TestCalendarSinceAll:
         if events_data is None:
             events_data = []
 
+        ranges = []
+
+        def capture_range(session, team_slug, since, until, limit=None):
+            ranges.append((team_slug, since, until, limit))
+            return events_data
+
         with patch("laget_cli.cli._get_session") as mock_session, \
              patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
              patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
-             patch("laget_cli.cli.fetch_calendar_range", return_value=events_data), \
+             patch("laget_cli.cli.fetch_calendar_range", side_effect=capture_range), \
+             patch("laget_cli.cli.date", FrozenDate), \
              patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
             mock_session.return_value = MagicMock()
             with patch("sys.argv", ["laget"] + argv):
                 out = StringIO()
                 with patch("sys.stdout", out):
                     main()
-                return json.loads(out.getvalue())
+                return json.loads(out.getvalue()), ranges
 
-    def test_since_all_does_not_crash(self):
-        """calendar --since all should not crash with TypeError."""
-        result = self._run(["calendar", "--since", "all"])
-        assert isinstance(result, list)
+    def test_since_all_uses_previous_year_through_default_window(self):
+        result, ranges = self._run_and_capture_range(["calendar", "--since", "all"])
+        assert result == []
+        assert ranges == [("TeamAlpha-P2021", "2025-03-15", "2026-04-14", None)]
 
-    def test_until_all_does_not_crash(self):
-        """calendar --until all should not crash with TypeError."""
-        result = self._run(["calendar", "--until", "all"])
-        assert isinstance(result, list)
+    def test_until_all_uses_current_day_through_next_year(self):
+        result, ranges = self._run_and_capture_range(["calendar", "--until", "all"])
+        assert result == []
+        assert ranges == [("TeamAlpha-P2021", "2026-03-15", "2027-03-15", None)]
+
+    def test_since_all_and_until_all_stay_bounded_to_24_months(self):
+        result, ranges = self._run_and_capture_range(["calendar", "--since", "all", "--until", "all"])
+        assert result == []
+        assert ranges == [("TeamAlpha-P2021", "2025-03-15", "2027-02-28", None)]

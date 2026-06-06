@@ -478,34 +478,22 @@ class TestGlobalFlagPosition:
         ("-q", "quiet", True),
     ])
     @pytest.mark.parametrize("position", ["before", "after"])
-    def test_flag_propagates(self, flag, attr, expected, position):
+    def test_flag_propagates(self, flag, attr, expected, position, monkeypatch):
+        import laget_cli.cli as cli_module
+
         argv_before = ["laget", flag, "notifications", "--since", "all"]
         argv_after = ["laget", "notifications", "--since", "all", flag]
         argv = argv_before if position == "before" else argv_after
 
-        notifications = [
-            {"date": "2026-03-29T00:00:00", "type": "news", "author": "A",
-             "title": "t", "team": "T1", "team_slug": "A", "url": "/x/News/1"},
-        ]
-        teams = [{"team_slug": "A", "name": "A", "club": "C"}]
+        captured = {}
+        monkeypatch.setattr(cli_module, "_configure_debug", lambda: None)
+        monkeypatch.setattr(cli_module, "_notifications", lambda args: captured.update(args=args))
+        monkeypatch.setattr(sys, "argv", argv)
 
-        from io import StringIO
-        with patch("laget_cli.cli._get_session") as mock_session, \
-             patch("laget_cli.cli.fetch_teams", return_value=teams), \
-             patch("laget_cli.cli.filter_teams_by_club", return_value=teams), \
-             patch("laget_cli.cli.fetch_notifications", return_value=notifications), \
-             patch("laget_cli.cli.resolve_team_names", side_effect=lambda n, t: n), \
-             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"}):
-            mock_session.return_value = MagicMock()
-            with patch("sys.argv", argv):
-                out = StringIO()
-                with patch("sys.stdout", out):
-                    main()
+        main()
 
-        assert getattr(pytest, "skip", None) or True  # ran without parse error
-        # For -q, argparse stores it under 'quiet'
-        # We can't easily inspect args after main() returns, but the fact that
-        # main() completed without error proves the flag was accepted in that position.
+        assert captured["args"].command == "notifications"
+        assert getattr(captured["args"], attr) is expected
 
 
 class TestGetStatusExceptionHandling:
