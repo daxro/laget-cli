@@ -85,6 +85,42 @@ class TestFieldsFlag:
         assert set(result[0].keys()) == {"date", "type"}
 
 
+class TestCalendarCommand:
+    def _run_calendar(self, argv, events_by_slug, teams_data=None):
+        from io import StringIO
+        if teams_data is None:
+            teams_data = [
+                {"team_slug": "TeamAlpha-P2021", "name": "P2021", "club": "FK"},
+                {"team_slug": "TeamAlpha-P2019", "name": "P2019", "club": "FK"},
+            ]
+
+        def fetch_calendar_range(_session, team_slug, _since, _until, limit=None):
+            events = events_by_slug.get(team_slug, [])
+            return events[:limit] if limit is not None else events
+
+        with patch("laget_cli.cli._get_session") as mock_session, \
+             patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
+             patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
+             patch("laget_cli.cli.fetch_calendar_range", side_effect=fetch_calendar_range), \
+             patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
+            mock_session.return_value = MagicMock()
+            with patch("sys.argv", ["laget", "-q"] + argv):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    main()
+                return json.loads(out.getvalue())
+
+    def test_calendar_preserves_team_envelope_when_events_are_empty(self):
+        result = self._run_calendar(
+            ["calendar", "--team", "P2021", "--since", "2026-06-01", "--until", "2026-06-30"],
+            {"TeamAlpha-P2021": []},
+        )
+
+        assert result == [
+            {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
+        ]
+
+
 class TestNotificationsLimit:
     def _run_notifications(self, argv, notifications_data, teams_data=None):
         from io import StringIO

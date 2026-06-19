@@ -779,9 +779,11 @@ class TestCalendarCommand:
                     main()
                 return json.loads(out.getvalue())
 
-    def test_empty_events_returns_empty_list(self):
+    def test_empty_events_preserve_team_envelope(self):
         result = self._run(["calendar"])
-        assert result == []
+        assert result == [
+            {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
+        ]
 
     def test_non_empty_output_has_team_structure(self):
         event_date = "2026-03-16"
@@ -1077,15 +1079,21 @@ class TestCalendarSinceAll:
 
     def test_since_all_uses_previous_year_through_default_window(self):
         result, ranges = self._run_and_capture_range(["calendar", "--since", "all"])
-        assert result == []
+        assert result == [
+            {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
+        ]
         assert ranges == [("TeamAlpha-P2021", "2025-03-15", "2026-04-14", None)]
 
     def test_until_all_uses_current_day_through_next_year(self):
         result, ranges = self._run_and_capture_range(["calendar", "--until", "all"])
-        assert result == []
+        assert result == [
+            {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
+        ]
         assert ranges == [("TeamAlpha-P2021", "2026-03-15", "2027-03-15", None)]
 
     def test_since_all_and_until_all_stay_bounded_to_24_months(self):
         result, ranges = self._run_and_capture_range(["calendar", "--since", "all", "--until", "all"])
-        assert result == []
+        assert result == [
+            {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
+        ]
         assert ranges == [("TeamAlpha-P2021", "2025-03-15", "2027-02-28", None)]

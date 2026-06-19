@@ -722,8 +722,6 @@ def _calendar(args):
     for team in teams:
         _progress(f"Fetching calendar for {team['team_slug']}...", args.quiet)
         events = fetch_calendar_range(session, team["team_slug"], since, until, limit=limit)
-        if not events:
-            continue
         output.append({
             "team": team["name"],
             "team_slug": team["team_slug"],
