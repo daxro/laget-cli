@@ -104,6 +104,8 @@ def sync_child_team_mapping(session, teams, children):
     child_ids = {c["id"] for c in children}
     mapping = {}
     for team in teams:
+        if mapping.keys() >= child_ids:
+            break
         member_ids = fetch_roster_member_ids(session, team["team_slug"])
         for child_id in child_ids:
             if child_id in member_ids:

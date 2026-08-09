@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 from laget_cli.api.teams import _parse_teams, _parse_children, filter_teams_by_club, fetch_teams, fetch_children
 from laget_cli.errors import ParseError
@@ -173,3 +173,22 @@ class TestFetchChildren:
         assert len(children) == 2
         session.get.assert_called_once()
         assert "/User/Children" in session.get.call_args[0][0]
+
+
+class TestSyncChildTeamMapping:
+    @patch("laget_cli.api.teams.fetch_roster_member_ids")
+    def test_stops_after_all_children_are_mapped(self, fetch_roster):
+        from laget_cli.api.teams import sync_child_team_mapping
+
+        fetch_roster.return_value = {"1", "2"}
+        teams = [
+            {"team_slug": "first"},
+            {"team_slug": "second"},
+            {"team_slug": "third"},
+        ]
+        children = [{"id": "1"}, {"id": "2"}]
+
+        mapping = sync_child_team_mapping(MagicMock(), teams, children)
+
+        assert mapping == {"1": "first", "2": "first"}
+        fetch_roster.assert_called_once_with(ANY, "first")

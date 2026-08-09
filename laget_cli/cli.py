@@ -36,6 +36,8 @@ except ImportError:
 
 _DEFAULT_SINCE_DAYS = 30
 _MAX_CALENDAR_MONTHS = 24
+# Leave time for callers with a 30-second limit to receive structured output.
+_STATUS_NETWORK_TIMEOUT = 25
 
 _STATUS_FIELDS = {
     "configured", "email", "club_filter", "session", "teams", "children",
@@ -154,6 +156,8 @@ def _sync_state(session, config, teams=None, children=None, quiet=False):
         }
         atomic_write_text(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
         return state
+    except requests.Timeout:
+        raise
     except (OSError, KeyError, ParseError, requests.RequestException) as e:
         _progress(f"Warning: could not sync child-team mapping: {e}", quiet)
         return None
@@ -170,7 +174,7 @@ def _load_state():
         return {}
 
 
-def _get_status(session=None, config=None, teams=None, children=None):
+def _get_status(session=None, config=None, teams=None, children=None, deadline_seconds=None):
     """Build status dict from config and session state."""
     config = _load_config() if config is None else config
     email, password = _credentials_from_mapping(config, str(CONFIG_FILE))
@@ -189,7 +193,12 @@ def _get_status(session=None, config=None, teams=None, children=None):
 
     if status["configured"]:
         if session is None:
-            session = login(email, password, session_path=str(SESSION_FILE))
+            session = login(
+                email,
+                password,
+                session_path=str(SESSION_FILE),
+                deadline_seconds=deadline_seconds,
+            )
         status["session"] = "valid"
         teams_available = teams is not None
         children_available = children is not None
@@ -198,6 +207,8 @@ def _get_status(session=None, config=None, teams=None, children=None):
                 teams = fetch_teams(session)
                 teams = filter_teams_by_club(teams, club_filter)
                 teams_available = True
+            except requests.Timeout:
+                raise
             except (requests.RequestException, ParseError) as e:
                 print(f"Warning: could not fetch teams: {e}", file=sys.stderr)
                 teams = []
@@ -206,6 +217,8 @@ def _get_status(session=None, config=None, teams=None, children=None):
             try:
                 children = fetch_children(session)
                 children_available = True
+            except requests.Timeout:
+                raise
             except (requests.RequestException, ParseError, KeyError) as e:
                 print(f"Warning: could not fetch children: {e}", file=sys.stderr)
                 children = []
@@ -257,7 +270,7 @@ def _status(args):
     if getattr(args, "fields", None) and not getattr(args, "json_output", False):
         emit_error("invalid_input", "--fields requires status --json.", exit_code=EXIT_USAGE)
     _validate_fields(args, _STATUS_FIELDS, "status")
-    status = _get_status()
+    status = _get_status(deadline_seconds=_STATUS_NETWORK_TIMEOUT)
     if getattr(args, "json_output", False):
         _output_json(status, args, _STATUS_FIELDS)
     else:
@@ -976,7 +989,11 @@ def main():
     except requests.HTTPError as e:
         emit_error("http_error", f"HTTP error: {e}", exit_code=EXIT_NETWORK)
     except requests.Timeout:
-        emit_error("request_timeout", "Request timed out.", exit_code=EXIT_NETWORK)
+        emit_error(
+            "request_timeout",
+            "Request timed out. Try again; if it persists, check your network connection.",
+            exit_code=EXIT_NETWORK,
+        )
     except requests.ConnectionError:
         emit_error("connection_failed", "Connection failed. Check your network.", exit_code=EXIT_NETWORK)
     except requests.RequestException as e:

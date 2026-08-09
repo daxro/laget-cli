@@ -202,6 +202,7 @@ class TestStatusCommand:
         assert output["session"] == "valid"
         assert len(output["teams"]) == 1
         assert len(output["children"]) == 1
+        assert mock_login.call_args.kwargs["deadline_seconds"] == 25
 
     @patch("laget_cli.cli._sync_state", return_value={"child_teams": {}})
     @patch("laget_cli.cli.fetch_children")
@@ -558,12 +559,23 @@ class TestGetStatusExceptionHandling:
     @patch("laget_cli.cli.filter_teams_by_club", return_value=[])
     @patch("laget_cli.cli.login", return_value=MagicMock())
     @patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"})
-    def test_teams_fetch_failure_warns_on_stderr(self, mock_dotenv, mock_login, mock_filter, mock_teams, mock_children, capsys):
+    def test_teams_fetch_timeout_propagates(self, mock_dotenv, mock_login, mock_filter, mock_teams, mock_children):
         from laget_cli.cli import _get_status
-        status = _get_status()
-        err = capsys.readouterr().err
-        assert "Warning" in err or "warning" in err
-        assert status["teams"] == []
+        with pytest.raises(requests.Timeout):
+            _get_status()
+
+    def test_roster_sync_timeout_propagates(self):
+        from laget_cli.cli import _sync_state
+
+        with patch("laget_cli.cli.sync_child_team_mapping", side_effect=requests.Timeout()):
+            with pytest.raises(requests.Timeout):
+                _sync_state(
+                    MagicMock(),
+                    {},
+                    teams=[{"name": "T1", "club": "C", "team_slug": "a"}],
+                    children=[{"name": "Alice", "id": "1"}],
+                    quiet=True,
+                )
 
 
 
@@ -596,6 +608,27 @@ class TestErrorHandling:
 
         err = json.loads(capsys.readouterr().err)
         assert err["error"] == "request_timeout"
+
+    @patch("laget_cli.cli.fetch_teams", side_effect=requests.Timeout())
+    @patch("laget_cli.cli.login", return_value=MagicMock())
+    @patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "t@t.com", "PASSWORD": "p"})
+    def test_status_timeout_emits_only_structured_error(
+        self, mock_dotenv, mock_login, mock_teams, capsys
+    ):
+        with patch("sys.argv", ["laget", "-q", "status", "--json"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        captured = capsys.readouterr()
+        assert exc.value.code == 5
+        assert captured.out == ""
+        assert json.loads(captured.err) == {
+            "error": "request_timeout",
+            "message": (
+                "Request timed out. Try again; if it persists, "
+                "check your network connection."
+            ),
+        }
 
     @patch("laget_cli.cli.login")
     @patch("laget_cli.cli.dotenv_values")
