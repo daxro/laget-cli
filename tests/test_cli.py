@@ -94,7 +94,14 @@ class TestCalendarCommand:
                 {"team_slug": "TeamAlpha-P2019", "name": "P2019", "club": "FK"},
             ]
 
-        def fetch_calendar_range(_session, team_slug, _since, _until, limit=None):
+        def fetch_calendar_range(
+            _session,
+            team_slug,
+            _since,
+            _until,
+            limit=None,
+            detail_fields=None,
+        ):
             events = events_by_slug.get(team_slug, [])
             return events[:limit] if limit is not None else events
 

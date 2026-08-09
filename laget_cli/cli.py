@@ -699,7 +699,12 @@ def _resolve_team_slug(args_team, teams, exact=False):
 
 
 def _calendar(args):
-    _validate_fields(args, _CALENDAR_EVENT_FIELDS, "calendar")
+    selected_fields = _validate_fields(args, _CALENDAR_EVENT_FIELDS, "calendar")
+    detail_fields = (
+        None
+        if selected_fields is None
+        else selected_fields & {"location", "assembly_time", "location_url", "notes", "rsvp"}
+    )
     config = _load_config()
     team_filter = getattr(args, "team", None)
     limit = getattr(args, "limit", None)
@@ -721,7 +726,14 @@ def _calendar(args):
     output = []
     for team in teams:
         _progress(f"Fetching calendar for {team['team_slug']}...", args.quiet)
-        events = fetch_calendar_range(session, team["team_slug"], since, until, limit=limit)
+        events = fetch_calendar_range(
+            session,
+            team["team_slug"],
+            since,
+            until,
+            limit=limit,
+            detail_fields=detail_fields,
+        )
         output.append({
             "team": team["name"],
             "team_slug": team["team_slug"],

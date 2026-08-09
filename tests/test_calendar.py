@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from laget_cli.api.calendar import (
+    _fetch_calendar_event_fields,
     _parse_calendar_month,
     _parse_event_detail,
     _parse_location,
@@ -652,13 +653,18 @@ class TestFetchCalendar:
 # ---------------------------------------------------------------------------
 
 class TestFetchCalendarRange:
-    def _make_session(self, events_by_month):
+    def _make_session(self, events_by_month, details_by_id=None):
         """Return a session mock that returns different events per month call."""
         session = MagicMock()
+        details_by_id = details_by_id or {}
 
         def side_effect(url, params=None, **kwargs):
             resp = MagicMock()
             resp.raise_for_status = MagicMock()
+            if url.endswith("/Event/Single"):
+                event_id = (params or {}).get("eventId")
+                resp.text = details_by_id.get(event_id, "<div>no event details</div>")
+                return resp
             month = (params or {}).get("month", 1)
             resp.text = events_by_month.get(month, CALENDAR_EMPTY_HTML)
             return resp
@@ -670,17 +676,58 @@ class TestFetchCalendarRange:
         session = self._make_session({3: CALENDAR_MONTH_HTML})
         events = fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-01", "2026-03-31")
         assert len(events) >= 1
-        assert session.get.call_count == 1
+        calendar_calls = [call for call in session.get.call_args_list if "FilterEvents" in call.args[0]]
+        assert len(calendar_calls) == 1
 
     def test_two_month_range_fetches_both(self):
         session = self._make_session({3: CALENDAR_MONTH_HTML, 4: CALENDAR_EMPTY_HTML})
         fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-15", "2026-04-15")
-        assert session.get.call_count == 2
+        calendar_calls = [call for call in session.get.call_args_list if "FilterEvents" in call.args[0]]
+        assert len(calendar_calls) == 2
 
     def test_year_boundary_range(self):
         session = self._make_session({12: CALENDAR_EMPTY_HTML, 1: CALENDAR_EMPTY_HTML})
         fetch_calendar_range(session, "TeamAlpha-P2021", "2025-12-15", "2026-01-15")
         assert session.get.call_count == 2
+
+    def test_enriches_calendar_events_with_detail_fields(self):
+        session = self._make_session(
+            {3: CALENDAR_MONTH_HTML},
+            {
+                "29705518": DETAIL_TRAINING_WITH_MAPS_HTML,
+                "29890125": DETAIL_MATCH_WITH_ASSEMBLY_HTML,
+            },
+        )
+
+        events = fetch_calendar_range(session, "TeamAlpha-P2021", "2026-03-01", "2026-03-31")
+
+        training = next(event for event in events if event["id"] == "29705518")
+        assert training["location"] == "Sjöängsskolan"
+        assert "google.com/maps/search" in training["location_url"]
+        assert training["notes"] == "Inomhusträning"
+        match = next(event for event in events if event["id"] == "29890125")
+        assert match["location"] == "Orminge BP"
+        assert match["assembly_time"] == "11:15"
+        detail_ids = [
+            call.kwargs["params"]["eventId"]
+            for call in session.get.call_args_list
+            if "/Event/Single" in call.args[0]
+        ]
+        assert detail_ids == ["29705518", "29890125"]
+
+    def test_empty_detail_fields_skips_detail_requests(self):
+        session = self._make_session({3: CALENDAR_MONTH_HTML})
+
+        events = fetch_calendar_range(
+            session,
+            "TeamAlpha-P2021",
+            "2026-03-01",
+            "2026-03-31",
+            detail_fields=set(),
+        )
+
+        assert len(events) == 2
+        assert all("FilterEvents" in call.args[0] for call in session.get.call_args_list)
 
     def test_deduplicates_by_event_id(self):
         # Same month HTML served for both months - same event IDs appear twice
@@ -705,7 +752,10 @@ class TestFetchCalendarRange:
             limit=1,
         )
         assert len(events) == 1
-        assert session.get.call_count == 1
+        calendar_calls = [call for call in session.get.call_args_list if "FilterEvents" in call.args[0]]
+        detail_calls = [call for call in session.get.call_args_list if "/Event/Single" in call.args[0]]
+        assert len(calendar_calls) == 1
+        assert len(detail_calls) == 1
 
     def test_range_over_24_months_is_rejected(self):
         session = self._make_session({})
@@ -751,6 +801,25 @@ class TestFetchEventDetail:
         kwargs = session.get.call_args[1]
         assert kwargs.get("params", {}).get("eventId") == "29705518"
 
+    def test_calendar_location_does_not_parse_unrequested_rsvp(self):
+        session = MagicMock()
+        resp = MagicMock()
+        resp.text = DETAIL_TRAINING_WITH_MAPS_HTML.replace(
+            "</div>\n",
+            '<a href="/TeamAlpha-P2021/Rsvp/29705518/7654321">Other invite</a>\n</div>\n',
+            1,
+        )
+        session.get.return_value = resp
+
+        detail = _fetch_calendar_event_fields(
+            session,
+            "TeamAlpha-P2021",
+            "29705518",
+            {"location"},
+        )
+
+        assert detail == {"location": "Sjöängsskolan"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -770,13 +839,14 @@ class TestCalendarCommand:
         with patch("laget_cli.cli._get_session") as mock_session, \
              patch("laget_cli.cli.fetch_teams", return_value=teams_data), \
              patch("laget_cli.cli.filter_teams_by_club", return_value=teams_data), \
-             patch("laget_cli.cli.fetch_calendar_range", return_value=events_data), \
+             patch("laget_cli.cli.fetch_calendar_range", return_value=events_data) as mock_fetch_calendar, \
              patch("laget_cli.cli.dotenv_values", return_value={"EMAIL": "x@x.com", "PASSWORD": "pw"}):
             mock_session.return_value = MagicMock()
             with patch("sys.argv", ["laget"] + argv):
                 out = StringIO()
                 with patch("sys.stdout", out):
                     main()
+                self.fetch_calendar_range = mock_fetch_calendar
                 return json.loads(out.getvalue())
 
     def test_empty_events_preserve_team_envelope(self):
@@ -784,6 +854,14 @@ class TestCalendarCommand:
         assert result == [
             {"team": "P2021", "team_slug": "TeamAlpha-P2021", "events": []},
         ]
+
+    def test_list_only_fields_skip_detail_enrichment(self):
+        self._run(["calendar", "--fields", "id,date,title"])
+        assert self.fetch_calendar_range.call_args.kwargs["detail_fields"] == set()
+
+    def test_location_field_requests_only_location_detail(self):
+        self._run(["calendar", "--fields", "location"])
+        assert self.fetch_calendar_range.call_args.kwargs["detail_fields"] == {"location"}
 
     def test_non_empty_output_has_team_structure(self):
         event_date = "2026-03-16"
@@ -1060,7 +1138,14 @@ class TestCalendarSinceAll:
 
         ranges = []
 
-        def capture_range(session, team_slug, since, until, limit=None):
+        def capture_range(
+            session,
+            team_slug,
+            since,
+            until,
+            limit=None,
+            detail_fields=None,
+        ):
             ranges.append((team_slug, since, until, limit))
             return events_data
 

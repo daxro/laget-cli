@@ -33,7 +33,14 @@ def fetch_calendar(session, team_slug, year, month):
     return _parse_calendar_month(resp.text, year, month)
 
 
-def fetch_calendar_range(session, team_slug, start_date, end_date, limit=None):
+def fetch_calendar_range(
+    session,
+    team_slug,
+    start_date,
+    end_date,
+    limit=None,
+    detail_fields=None,
+):
     """Fetch calendar events across a date range, spanning multiple months if needed.
 
     Args:
@@ -42,6 +49,7 @@ def fetch_calendar_range(session, team_slug, start_date, end_date, limit=None):
         start_date: ISO date string "YYYY-MM-DD" or None
         end_date: ISO date string "YYYY-MM-DD" or None
         limit: maximum number of events to return
+        detail_fields: detail fields to fetch, all detail fields when None
 
     Returns a deduplicated, sorted list of event dicts.
     """
@@ -89,6 +97,21 @@ def fetch_calendar_range(session, team_slug, start_date, end_date, limit=None):
             break
 
     all_events.sort(key=lambda e: e["date"])
+    requested_detail_fields = (
+        {"location", "assembly_time", "location_url", "notes", "rsvp"}
+        if detail_fields is None
+        else set(detail_fields)
+    )
+    for event in all_events:
+        if requested_detail_fields:
+            event.update(
+                _fetch_calendar_event_fields(
+                    session,
+                    team_slug,
+                    event["id"],
+                    requested_detail_fields,
+                )
+            )
     return all_events
 
 
@@ -216,13 +239,8 @@ def _parse_event_item(html, event_id, year, month, day):
     }
 
 
-def fetch_event_detail(session, team_slug, event_id):
-    """Fetch the event detail fragment for a single event.
-
-    GET /{team_slug}/Event/Single?eventId={event_id}
-
-    Returns a parsed event detail dict.
-    """
+def _fetch_event_detail_html(session, team_slug, event_id):
+    """Fetch the raw event detail fragment for a single event."""
     resp = session.get(
         f"{BASE_URL}/{team_slug}/Event/Single",
         params={"eventId": event_id},
@@ -230,7 +248,31 @@ def fetch_event_detail(session, team_slug, event_id):
         timeout=HTTP_TIMEOUT,
     )
     resp.raise_for_status()
-    return _parse_event_detail(resp.text, event_id, team_slug)
+    return resp.text
+
+
+def _fetch_calendar_event_fields(session, team_slug, event_id, fields):
+    """Fetch and parse only the requested calendar detail fields."""
+    html = _fetch_event_detail_html(session, team_slug, event_id)
+    parsers = {
+        "location": _parse_location,
+        "assembly_time": _parse_assembly_time,
+        "location_url": _parse_maps_url,
+        "notes": _parse_notes,
+        "rsvp": _parse_rsvp,
+    }
+    return {field: parsers[field](html) for field in fields}
+
+
+def fetch_event_detail(session, team_slug, event_id):
+    """Fetch the event detail fragment for a single event.
+
+    GET /{team_slug}/Event/Single?eventId={event_id}
+
+    Returns a parsed event detail dict.
+    """
+    html = _fetch_event_detail_html(session, team_slug, event_id)
+    return _parse_event_detail(html, event_id, team_slug)
 
 
 def _parse_event_detail(html, event_id, team_slug):
