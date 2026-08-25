@@ -3,12 +3,13 @@ import json
 import os
 import pathlib
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import requests.cookies
 import pytest
 
 from laget_cli.session import (
+    LagetSession,
     follow_redirects,
     parse_hidden_fields,
     save_session,
@@ -17,6 +18,44 @@ from laget_cli.session import (
     login,
 )
 from laget_cli.errors import AuthError
+
+
+class TestLagetSessionDeadline:
+    def test_clamps_each_request_to_remaining_budget(self):
+        session = LagetSession(deadline=125)
+        response = MagicMock()
+
+        with patch("laget_cli.session.time.monotonic", side_effect=[100, 101, 110, 111]), \
+             patch.object(requests.Session, "request", return_value=response) as request:
+            session.get("https://example.com/one", timeout=30)
+            session.get("https://example.com/two", timeout=30)
+
+        first_timeout = request.call_args_list[0].kwargs["timeout"]
+        second_timeout = request.call_args_list[1].kwargs["timeout"]
+        assert first_timeout.total == 25
+        assert first_timeout.connect_timeout == 25
+        assert first_timeout.read_timeout == 25
+        assert second_timeout.total == 15
+        assert second_timeout.connect_timeout == 15
+        assert second_timeout.read_timeout == 15
+
+    def test_raises_before_request_when_budget_is_exhausted(self):
+        session = LagetSession(deadline=100)
+
+        with patch("laget_cli.session.time.monotonic", return_value=100), \
+             patch.object(requests.Session, "request") as request:
+            with pytest.raises(requests.Timeout, match="deadline"):
+                session.get("https://example.com", timeout=30)
+
+        request.assert_not_called()
+
+    def test_raises_when_request_consumes_remaining_budget(self):
+        session = LagetSession(deadline=125)
+
+        with patch("laget_cli.session.time.monotonic", side_effect=[100, 125]), \
+             patch.object(requests.Session, "request", return_value=MagicMock()):
+            with pytest.raises(requests.Timeout, match="deadline"):
+                session.get("https://example.com", timeout=30)
 
 
 class TestFollowRedirects:
@@ -289,3 +328,26 @@ class TestLogin:
             assert session.post.call_count == 0
         finally:
             os.unlink(path)
+
+    def test_reauthentication_preserves_original_deadline(self):
+        expired_session = MagicMock()
+        expired_response = MagicMock(status_code=302)
+        expired_session.get.return_value = expired_response
+
+        login_session = self._mock_login_flow()
+        with patch("laget_cli.session.time.monotonic", return_value=100), \
+             patch("laget_cli.session.new_session", side_effect=[expired_session, login_session]) as new_session, \
+             patch("laget_cli.session.load_session", return_value=True), \
+             patch("laget_cli.session.save_session"):
+            result = login(
+                "test@example.com",
+                "password123",
+                session_path="session.json",
+                deadline_seconds=25,
+            )
+
+        assert result is login_session
+        assert new_session.call_args_list == [
+            call(deadline=125),
+            call(deadline=125),
+        ]

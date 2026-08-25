@@ -4,10 +4,12 @@ import http.cookiejar
 import json
 import os
 import re
+import time
 from html import unescape
 from urllib.parse import urljoin
 
 import requests
+from urllib3.util import Timeout
 
 from laget_cli.errors import AuthError
 from laget_cli.paths import atomic_write_text
@@ -22,9 +24,39 @@ USER_AGENT = (
 )
 
 
-def new_session():
+class LagetSession(requests.Session):
+    """Requests session with an optional shared, best-effort request deadline."""
+
+    def __init__(self, deadline=None):
+        super().__init__()
+        self.deadline = deadline
+
+    def request(self, method, url, **kwargs):
+        if self.deadline is None:
+            return super().request(method, url, **kwargs)
+
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout("Network deadline exceeded")
+
+        configured = kwargs.get("timeout", HTTP_TIMEOUT)
+        if isinstance(configured, tuple):
+            connect, read = configured
+        else:
+            connect = read = configured
+        connect = remaining if connect is None else min(connect, remaining)
+        read = remaining if read is None else min(read, remaining)
+        kwargs["timeout"] = Timeout(total=remaining, connect=connect, read=read)
+
+        response = super().request(method, url, **kwargs)
+        if time.monotonic() >= self.deadline:
+            raise requests.Timeout("Network deadline exceeded")
+        return response
+
+
+def new_session(deadline=None):
     """Create a requests.Session with browser User-Agent."""
-    s = requests.Session()
+    s = LagetSession(deadline=deadline)
     s.headers["User-Agent"] = USER_AGENT
     return s
 
@@ -132,7 +164,7 @@ def verify_authenticated(session):
         raise AuthError("Auth check returned unexpected response")
 
 
-def login(email, password, session_path="session.json", _session=None):
+def login(email, password, session_path="session.json", _session=None, deadline_seconds=None):
     """Log into laget.se with email and password.
 
     Creates a requests.Session, POSTs credentials to the login form,
@@ -146,6 +178,7 @@ def login(email, password, session_path="session.json", _session=None):
         password: User's password.
         session_path: Path to session.json for persistence. None to disable.
         _session: Inject a session for testing. Created if not provided.
+        deadline_seconds: Shared network budget for all authentication requests.
 
     Returns:
         Authenticated requests.Session.
@@ -153,7 +186,14 @@ def login(email, password, session_path="session.json", _session=None):
     Raises:
         AuthError: If login fails or session cannot be verified.
     """
-    session = _session or new_session()
+    deadline = (
+        time.monotonic() + deadline_seconds
+        if deadline_seconds is not None
+        else None
+    )
+    session = _session or new_session(deadline=deadline)
+    if deadline is not None and isinstance(session, LagetSession):
+        session.deadline = deadline
 
     # Try saved session first
     if session_path and load_session(session, session_path):
@@ -161,7 +201,9 @@ def login(email, password, session_path="session.json", _session=None):
             verify_authenticated(session)
             return session
         except AuthError:
-            session = _session or new_session()
+            session = _session or new_session(deadline=deadline)
+            if deadline is not None and isinstance(session, LagetSession):
+                session.deadline = deadline
 
     # Step 1: GET login page to extract CSRF token and hidden fields
     resp = session.get(

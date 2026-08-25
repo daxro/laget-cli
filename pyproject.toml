@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77.0.3"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-completion = ["argcomplete>=3.0"]
+completion = ["argcomplete>=3.7.0"]
 
 [project.scripts]
 laget = "laget_cli.cli:main"
@@ -28,7 +28,7 @@ Issues = "https://github.com/daxro/laget-cli/issues"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.2",
+    "pytest>=9.1.1",
 ]
 
 [tool.pytest.ini_options]
