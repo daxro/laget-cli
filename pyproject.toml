@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-completion = ["argcomplete>=3.0"]
+completion = ["argcomplete>=3.7.0"]
 
 [project.scripts]
 laget = "laget_cli.cli:main"
