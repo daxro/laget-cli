@@ -139,9 +139,13 @@ def _concernee_states(event):
     for concernee in raw_concernees:
         if not isinstance(concernee, dict) or concernee.get("id") is None:
             continue
-        member_id = str(concernee["id"])
         state = concernee.get("rsvp")
-        state = dict(state) if isinstance(state, dict) else {}
+        if not isinstance(state, dict):
+            # The app treats a concernee without an RSVP object as a person
+            # associated with the event, not as an invited RSVP recipient.
+            continue
+        member_id = str(concernee["id"])
+        state = dict(state)
         by_member[member_id] = state
         responses.append({
             "id": member_id,

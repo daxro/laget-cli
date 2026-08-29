@@ -121,6 +121,82 @@ def test_concernees_are_normalized_and_single_child_is_default_target():
     assert session.put.call_args.args[0].endswith("/v1/events/10/rsvp/88")
 
 
+@pytest.mark.parametrize("concernee", [
+    {"id": 88, "name": "Barnet", "rsvp": None},
+    {"id": 88, "name": "Barnet"},
+])
+def test_concernee_without_rsvp_is_not_an_eligible_recipient(concernee):
+    event = _event(userRsvp=None, concernees=[concernee])
+    session = _session({"event": event})
+
+    detail = fetch_event_detail(session, "Club-Team", "10")
+
+    assert detail["responses"] == []
+    assert detail["rsvp"]["url"] is None
+    with pytest.raises(ParseError, match="not eligible"):
+        submit_rsvp(
+            session,
+            None,
+            "yes",
+            event_id="10",
+            member_id="88",
+        )
+    session.put.assert_not_called()
+
+
+def test_real_unanswered_invitee_wins_over_null_rsvp_concernee():
+    event = _event(
+        userRsvp=None,
+        concernees=[
+            {"id": 88, "name": "Inte inbjuden", "rsvp": None},
+            {
+                "id": 99,
+                "name": "Inbjuden",
+                "rsvp": {
+                    "attending": 0,
+                    "numCarSeats": 0,
+                    "attendingAssembly": 0,
+                },
+            },
+        ],
+    )
+    session = _session({"event": event})
+
+    detail = fetch_event_detail(session, "Club-Team", "10")
+
+    assert detail["responses"] == [{
+        "id": "99",
+        "name": "Inbjuden",
+        "my_response": "unanswered",
+        "answer": None,
+        "reason": None,
+    }]
+    assert detail["rsvp"]["url"].endswith("/Rsvp/10/99")
+    submit_rsvp(session, detail["rsvp"]["url"], "yes", event_id="10")
+    assert session.put.call_args.kwargs["json"] == {
+        "siteId": 44,
+        "attending": 1,
+        "car": 0,
+        "assembly": 0,
+        "answer": "",
+        "reason": "",
+    }
+
+
+def test_authenticated_user_rsvp_remains_eligible_when_concernee_rsvp_is_null():
+    event = _event(
+        concernees=[{"id": 88, "name": "Barnet", "rsvp": None}],
+    )
+    session = _session({"event": event})
+
+    detail = fetch_event_detail(session, "Club-Team", "10")
+
+    assert detail["responses"] == []
+    assert detail["rsvp"]["url"].endswith("/Rsvp/10/77")
+    submit_rsvp(session, detail["rsvp"]["url"], "yes", event_id="10")
+    assert session.put.call_args.args[0].endswith("/v1/events/10/rsvp/77")
+
+
 def test_multiple_concernees_require_explicit_eligible_member():
     event = _event(
         userRsvp=None,
