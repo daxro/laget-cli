@@ -22,7 +22,17 @@ from laget_cli.errors import (
     EXIT_NOT_FOUND,
     EXIT_USAGE,
 )
-from laget_cli.api import fetch_article, fetch_calendar_range, fetch_event_detail, fetch_notifications, fetch_teams, fetch_children, filter_teams_by_club, submit_rsvp, sync_child_team_mapping
+from laget_cli.api import (
+    fetch_article,
+    fetch_calendar_range,
+    fetch_children,
+    fetch_event_detail,
+    fetch_notifications,
+    fetch_teams,
+    filter_teams_by_club,
+    submit_rsvp,
+    sync_child_team_mapping,
+)
 from laget_cli.api.notifications import resolve_team_names
 from laget_cli.paths import CONFIG_FILE, SESSION_FILE, STATE_FILE, atomic_write_text
 from laget_cli.session import login, save_session
@@ -43,7 +53,10 @@ _STATUS_FIELDS = {
     "configured", "email", "club_filter", "session", "teams", "children",
     "config_path", "session_path",
 }
-_NOTIFICATION_FIELDS = {"date", "type", "author", "title", "team", "team_slug", "url"}
+_FEED_FIELDS = {
+    "id", "type", "title", "body", "date", "author", "comment_count",
+    "site_id", "site_name", "team", "team_slug", "url",
+}
 _CALENDAR_EVENT_FIELDS = {
     "id", "type", "title", "cancelled", "date", "start_time", "end_time",
     "location", "assembly_time", "location_url", "notes", "rsvp",
@@ -139,42 +152,66 @@ def _get_session(quiet=False):
     return login(email, password, session_path=str(SESSION_FILE))
 
 
+def _public_team(team):
+    """Project an API team to the stable, non-sensitive CLI representation."""
+    return {key: team.get(key) for key in ("name", "club", "team_slug")}
+
+
+def _prepare_teams(session, config=None):
+    """Fetch teams and attach their private site IDs to the API session."""
+    teams = fetch_teams(session)
+    session.team_site_ids = {
+        team["team_slug"]: team.get("_site_id")
+        for team in teams
+        if team.get("team_slug") and team.get("_site_id") is not None
+    }
+    club_filter = (config or {}).get("CLUB")
+    return filter_teams_by_club(teams, club_filter)
+
+
 def _sync_state(session, config, teams=None, children=None, quiet=False):
-    """Sync child-team mapping after successful auth."""
+    """Persist API-derived child mappings when an implementation is available."""
     try:
-        if teams is None:
-            teams = filter_teams_by_club(fetch_teams(session), config.get("CLUB"))
-        if children is None:
-            children = fetch_children(session)
+        teams = _prepare_teams(session, config) if teams is None else teams
+        children = fetch_children(session) if children is None else children
         mapping = sync_child_team_mapping(session, teams, children)
-        team_names = {t["team_slug"]: t["name"] for t in teams}
+        team_names = {team["team_slug"]: team["name"] for team in teams}
         state = {
+            "api_version": 2,
             "child_teams": {
-                cid: {"team_slug": slug, "team_name": team_names.get(slug, slug)}
-                for cid, slug in mapping.items()
-            }
+                child_id: {
+                    "team_slug": slug,
+                    "team_name": team_names.get(slug, slug),
+                }
+                for child_id, slug in mapping.items()
+            },
         }
         atomic_write_text(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
         return state
-    except requests.Timeout:
-        raise
-    except (OSError, KeyError, ParseError, requests.RequestException) as e:
-        _progress(f"Warning: could not sync child-team mapping: {e}", quiet)
+    except (OSError, KeyError, ParseError, requests.RequestException) as error:
+        _progress(f"Warning: could not sync child-team mapping: {error}", quiet)
         return None
 
 
 def _load_state():
-    """Load cached state (child-team mapping). Returns empty dict on failure."""
     if not STATE_FILE.exists():
         return {}
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        with open(STATE_FILE, encoding="utf-8") as file:
+            return json.load(file)
     except (json.JSONDecodeError, OSError):
         return {}
 
 
-def _get_status(session=None, config=None, teams=None, children=None, deadline_seconds=None):
+def _get_status(
+    session=None,
+    config=None,
+    teams=None,
+    children=None,
+    deadline_seconds=None,
+    include_teams=True,
+    include_children=True,
+):
     """Build status dict from config and session state."""
     config = _load_config() if config is None else config
     email, password = _credentials_from_mapping(config, str(CONFIG_FILE))
@@ -200,41 +237,32 @@ def _get_status(session=None, config=None, teams=None, children=None, deadline_s
                 deadline_seconds=deadline_seconds,
             )
         status["session"] = "valid"
-        teams_available = teams is not None
-        children_available = children is not None
-        if not teams_available:
-            try:
-                teams = fetch_teams(session)
-                teams = filter_teams_by_club(teams, club_filter)
-                teams_available = True
-            except requests.Timeout:
-                raise
-            except (requests.RequestException, ParseError) as e:
-                print(f"Warning: could not fetch teams: {e}", file=sys.stderr)
-                teams = []
-        status["teams"] = teams
-        if not children_available:
-            try:
-                children = fetch_children(session)
-                children_available = True
-            except requests.Timeout:
-                raise
-            except (requests.RequestException, ParseError, KeyError) as e:
-                print(f"Warning: could not fetch children: {e}", file=sys.stderr)
-                children = []
-
-        state = (
-            _sync_state(session, config, teams=teams, children=children, quiet=True)
-            if teams_available and children_available
-            else None
-        )
-        state = state if state is not None else _load_state()
-        child_teams = state.get("child_teams", {})
-        for child in children:
-            ct = child_teams.get(child["id"])
-            child["team_slug"] = ct["team_slug"] if ct else None
-            child["team_name"] = ct["team_name"] if ct else None
-        status["children"] = children
+        if (include_teams or include_children) and teams is None:
+            teams = _prepare_teams(session, config)
+        if include_teams:
+            status["teams"] = [_public_team(team) for team in teams]
+        if include_children:
+            if children is None:
+                try:
+                    children = fetch_children(session)
+                except (requests.RequestException, ParseError, KeyError) as error:
+                    print(f"Warning: could not fetch children: {error}", file=sys.stderr)
+                    children = []
+            state = _sync_state(
+                session,
+                config,
+                teams=teams,
+                children=children,
+                quiet=True,
+            )
+            state = state if state is not None else _load_state()
+            child_teams = state.get("child_teams", {})
+            for child in children:
+                child = dict(child)
+                mapping = child_teams.get(child.get("id"))
+                child["team_slug"] = mapping.get("team_slug") if mapping else None
+                child["team_name"] = mapping.get("team_name") if mapping else None
+                status["children"].append(child)
 
     return status
 
@@ -259,18 +287,21 @@ def _print_status(status):
     if status["children"]:
         print("Children:")
         for child in status["children"]:
-            team = child.get("team_name")
-            if team:
-                print(f"  - {child['name']} -> {team}")
-            else:
-                print(f"  - {child['name']}")
+            suffix = f" -> {child['team_name']}" if child.get("team_name") else ""
+            print(f"  - {child['name']}{suffix}")
 
 
 def _status(args):
     if getattr(args, "fields", None) and not getattr(args, "json_output", False):
         emit_error("invalid_input", "--fields requires status --json.", exit_code=EXIT_USAGE)
-    _validate_fields(args, _STATUS_FIELDS, "status")
-    status = _get_status(deadline_seconds=_STATUS_NETWORK_TIMEOUT)
+    fields = _validate_fields(args, _STATUS_FIELDS, "status")
+    include_children = fields is None or "children" in fields
+    include_teams = fields is None or "teams" in fields or include_children
+    status = _get_status(
+        deadline_seconds=_STATUS_NETWORK_TIMEOUT,
+        include_teams=include_teams,
+        include_children=include_children,
+    )
     if getattr(args, "json_output", False):
         _output_json(status, args, _STATUS_FIELDS)
     else:
@@ -413,7 +444,10 @@ def _persist_setup(email, password, club, session, reset_state=False):
         _write_env(email, password, club)
         save_session(session, SESSION_FILE)
         if reset_state:
-            atomic_write_text(STATE_FILE, json.dumps({"child_teams": {}}, indent=2))
+            atomic_write_text(
+                STATE_FILE,
+                json.dumps({"child_teams": {}}, indent=2),
+            )
     except Exception:
         _restore_file(CONFIG_FILE, previous_config)
         _restore_file(SESSION_FILE, previous_session)
@@ -627,11 +661,16 @@ def _filter_by_team(items, team_filter):
     if team_filter is None:
         return items
     team_filter_lower = team_filter.lower()
-    return [item for item in items if team_filter_lower in item["team_slug"].lower()]
+    return [
+        item for item in items
+        if isinstance(item.get("team_slug"), str)
+        and team_filter_lower in item["team_slug"].lower()
+    ]
 
 
 def _notifications(args):
-    _validate_fields(args, _NOTIFICATION_FIELDS, "notifications")
+    command = getattr(args, "command", "feed")
+    _validate_fields(args, _FEED_FIELDS, command)
     config = _load_config()
     since = _resolve_since(getattr(args, "since", None), config)
     until = _resolve_until(getattr(args, "until", None))
@@ -640,10 +679,13 @@ def _notifications(args):
 
     session = _get_session(quiet=args.quiet)
     _progress("Fetching teams...", args.quiet)
-    all_teams = fetch_teams(session)
+    all_teams = _prepare_teams(session)
 
-    _progress("Fetching notifications...", args.quiet)
-    notifications = fetch_notifications(session)
+    _progress("Fetching content feed...", args.quiet)
+    notifications = fetch_notifications(
+        session,
+        since=since,
+    )
     resolve_team_names(notifications, all_teams)
 
     # Filter to club teams after resolving names (so all teams get names)
@@ -663,7 +705,7 @@ def _notifications(args):
     if limit is not None:
         notifications = notifications[:limit]
 
-    _output_json(notifications, args, _NOTIFICATION_FIELDS)
+    _output_json(notifications, args, _FEED_FIELDS)
 
 
 def _news(args):
@@ -672,14 +714,13 @@ def _news(args):
     config = _load_config()
     club_filter = config.get("CLUB")
 
-    teams = fetch_teams(session)
-    teams = filter_teams_by_club(teams, club_filter)
-    team_slug, team_name = _resolve_team_slug(args.team, teams)
+    teams = _prepare_teams(session, config)
+    team = _resolve_team(args.team, teams)
 
     _progress(f"Fetching article {args.id}...", args.quiet)
-    article = fetch_article(session, team_slug, args.id)
-    article["team"] = team_name
-    article["team_slug"] = team_slug
+    article = fetch_article(session, team, args.id)
+    article["team"] = team["name"]
+    article["team_slug"] = team["team_slug"]
 
     _output_json(article, args, _NEWS_FIELDS)
 
@@ -698,7 +739,11 @@ def _resolve_team_slug(args_team, teams, exact=False):
             f"No team with exact slug '{args_team}'.",
             exit_code=EXIT_NOT_FOUND,
         )
-    matches = [(slug, name) for slug, name in team_slugs.items() if args_team.lower() in slug.lower()]
+    matches = [
+        (slug, name)
+        for slug, name in team_slugs.items()
+        if isinstance(slug, str) and args_team.lower() in slug.lower()
+    ]
     if not matches:
         emit_error("team_not_found", f"No team matching '{args_team}'.", exit_code=EXIT_NOT_FOUND)
     if len(matches) > 1:
@@ -709,6 +754,12 @@ def _resolve_team_slug(args_team, teams, exact=False):
             exit_code=EXIT_USAGE,
         )
     return matches[0]
+
+
+def _resolve_team(args_team, teams, exact=False):
+    """Resolve a team argument and retain its private API identifiers."""
+    slug, _ = _resolve_team_slug(args_team, teams, exact=exact)
+    return next(team for team in teams if team.get("team_slug") == slug)
 
 
 def _calendar(args):
@@ -728,11 +779,15 @@ def _calendar(args):
 
     session = _get_session(quiet=args.quiet)
     _progress("Fetching teams...", args.quiet)
-    teams = fetch_teams(session)
-    teams = filter_teams_by_club(teams, config.get("CLUB"))
+    teams = _prepare_teams(session, config)
+    teams = [team for team in teams if isinstance(team.get("team_slug"), str)]
 
     if team_filter:
-        teams = [t for t in teams if team_filter.lower() in t["team_slug"].lower()]
+        teams = [
+            team for team in teams
+            if isinstance(team.get("team_slug"), str)
+            and team_filter.lower() in team["team_slug"].lower()
+        ]
         if not teams:
             emit_error("team_not_found", f"No team matching '{team_filter}'.", exit_code=EXIT_NOT_FOUND)
 
@@ -762,8 +817,7 @@ def _event(args):
     config = _load_config()
     club_filter = config.get("CLUB")
 
-    teams = fetch_teams(session)
-    teams = filter_teams_by_club(teams, club_filter)
+    teams = _prepare_teams(session, config)
     team_slug, team_name = _resolve_team_slug(args.team, teams)
 
     _progress(f"Fetching event {args.id}...", args.quiet)
@@ -779,24 +833,46 @@ def _rsvp(args):
     config = _load_config()
     club_filter = config.get("CLUB")
 
-    teams = fetch_teams(session)
-    teams = filter_teams_by_club(teams, club_filter)
+    teams = _prepare_teams(session, config)
     team_slug, team_name = _resolve_team_slug(args.team, teams, exact=True)
 
     _progress(f"Fetching event {args.id}...", args.quiet)
     detail = fetch_event_detail(session, team_slug, args.id)
     rsvp = detail.get("rsvp")
     rsvp_url = rsvp.get("url") if rsvp else None
-    if not rsvp_url:
-        emit_error("rsvp_not_found", f"Event {args.id} has no RSVP link.", exit_code=EXIT_NOT_FOUND)
+    if not rsvp:
+        emit_error("rsvp_not_found", f"Event {args.id} has no RSVP.", exit_code=EXIT_NOT_FOUND)
 
     _progress(f"Submitting RSVP for event {args.id}...", args.quiet)
-    submit_rsvp(session, rsvp_url, args.response, comment=args.comment, event_id=args.id)
+    submit_result = submit_rsvp(
+        session,
+        rsvp_url,
+        args.response,
+        comment=args.comment,
+        event_id=args.id,
+        member_id=getattr(args, "member", None),
+    )
 
     _progress(f"Verifying RSVP for event {args.id}...", args.quiet)
     updated = fetch_event_detail(session, team_slug, args.id)
     updated["team"] = team_name
-    updated_response = (updated.get("rsvp") or {}).get("my_response")
+    target_member_id = getattr(submit_result, "laget_member_id", None)
+    if target_member_id is not None:
+        target = next(
+            (
+                item for item in updated.get("responses", [])
+                if str(item.get("id")) == str(target_member_id)
+            ),
+            None,
+        )
+        if target is not None:
+            updated_response = target.get("my_response")
+        elif str(target_member_id) == str(getattr(session, "user_id", None)):
+            updated_response = (updated.get("rsvp") or {}).get("my_response")
+        else:
+            updated_response = None
+    else:
+        updated_response = (updated.get("rsvp") or {}).get("my_response")
     if updated_response != args.response:
         emit_error(
             "rsvp_update_failed",
@@ -873,10 +949,10 @@ def print_logo():
 def main():
     parser = _LagetParser(
         prog="laget",
-        description="Fetch data from laget.se - teams, notifications, calendar, and more.",
+        description="Fetch data from laget.se's mobile JSON API.",
         epilog="""examples:
-  laget notifications                   Activity from last 30 days
-  laget notifications --team tigers     Filter by team
+  laget feed                            Content from the last 30 days
+  laget feed --team tigers              Filter by team
   laget calendar --since 2026-01-01     Events since a date
   laget news --team tigers 12345        News article detail
   laget event --team tigers 67890       Event with RSVP details
@@ -911,12 +987,12 @@ def main():
   Prefer interactive setup when a person is available.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    status_parser = subparsers.add_parser("status", help="Show configuration, session, teams, and children",
+    status_parser = subparsers.add_parser("status", help="Show configuration, API session, and teams",
                                           parents=[_global_flags])
     status_parser.add_argument("--json", dest="json_output", action="store_true", help="Output status as JSON to stdout")
 
     notif_parser = subparsers.add_parser(
-        "notifications", help="Show recent activity feed across teams",
+        "feed", aliases=["notifications"], help="Show the mobile API content feed",
         parents=[_global_flags],
     )
     notif_parser.add_argument("--team", help="Filter by team slug (substring match)")
@@ -947,6 +1023,7 @@ def main():
     rsvp_parser.add_argument("id", type=_numeric_id, help="Event ID")
     rsvp_parser.add_argument("response", choices=["yes", "no"], help="RSVP response")
     rsvp_parser.add_argument("--comment", help="Optional RSVP comment when the event form supports comments")
+    rsvp_parser.add_argument("--member", help="Concernee/member ID when an event targets multiple people")
 
     subparsers.add_parser("reset", parents=[_global_flags], help="Remove all config, session, and state files")
 
@@ -968,7 +1045,7 @@ def main():
             _setup(args)
         elif args.command == "status":
             _status(args)
-        elif args.command == "notifications":
+        elif args.command in {"feed", "notifications"}:
             _notifications(args)
         elif args.command == "news":
             _news(args)

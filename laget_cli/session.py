@@ -1,12 +1,10 @@
-"""laget.se session management - login, cookie persistence, auth verification."""
+"""laget.se JSON API session management and token persistence."""
 
-import http.cookiejar
 import json
 import os
-import re
 import time
-from html import unescape
-from urllib.parse import urljoin
+from copy import deepcopy
+from urllib.parse import urlparse
 
 import requests
 from urllib3.util import Timeout
@@ -14,24 +12,64 @@ from urllib3.util import Timeout
 from laget_cli.errors import AuthError
 from laget_cli.paths import atomic_write_text
 
-AJAX_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
-BASE_URL = "https://www.laget.se"
-HTTP_TIMEOUT = 30
-REDIRECT_CODES = (301, 302, 307, 308)
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+API_URL = "https://api.laget.se"
+HTTP_TIMEOUT = 60
+SESSION_VERSION = 2
+
+APP_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Lagetse-App-Version": "3.3.7",
+    "Lagetse-App-Build-Version": "939",
+    "Lagetse-App-Platform": "android",
+}
 
 
 class LagetSession(requests.Session):
-    """Requests session with an optional shared, best-effort request deadline."""
+    """API session with identity state and an optional shared request deadline."""
 
     def __init__(self, deadline=None):
         super().__init__()
         self.deadline = deadline
+        self.auth_token = None
+        self.user_id = None
+        self._email = None
+        self._password = None
+        self._session_path = None
+        self._reauthenticating = False
 
     def request(self, method, url, **kwargs):
+        skip_reauth = kwargs.pop("_laget_skip_reauth", False)
+        replay_kwargs = _copy_request_kwargs(kwargs)
+        response = self._request_once(method, url, **kwargs)
+        if (
+            response.status_code == 401
+            and not skip_reauth
+            and not self._reauthenticating
+            and urlparse(url).path.rstrip("/") != "/v1/session"
+            and self._email is not None
+            and self._password is not None
+        ):
+            response.close()
+            self._reauthenticating = True
+            try:
+                _clear_identity(self)
+                _login_with_credentials(self, self._email, self._password)
+                verify_authenticated(self)
+                if self._session_path:
+                    save_session(self, self._session_path)
+            finally:
+                self._reauthenticating = False
+            # Use the low-level path so a second 401/403 is returned directly.
+            response = self._request_once(method, url, **replay_kwargs)
+            if response.status_code == 401:
+                response.close()
+                raise AuthError(
+                    f"Authentication failed after token refresh ({response.status_code})"
+                )
+        return response
+
+    def _request_once(self, method, url, **kwargs):
         if self.deadline is None:
             return super().request(method, url, **kwargs)
 
@@ -54,138 +92,125 @@ class LagetSession(requests.Session):
         return response
 
 
+def _copy_request_kwargs(kwargs):
+    """Copy API request inputs before requests prepares a possible replay."""
+    copied = dict(kwargs)
+    for key in ("headers", "params", "json", "data"):
+        value = copied.get(key)
+        if isinstance(value, (dict, list, tuple)):
+            copied[key] = deepcopy(value)
+    return copied
+
+
 def new_session(deadline=None):
-    """Create a requests.Session with browser User-Agent."""
-    s = LagetSession(deadline=deadline)
-    s.headers["User-Agent"] = USER_AGENT
-    return s
+    """Create a session configured like the official Android JSON API client."""
+    session = LagetSession(deadline=deadline)
+    session.headers.update(APP_HEADERS)
+    return session
 
 
-def follow_redirects(session, resp, max_hops=20):
-    """Manually follow HTTP redirects, resolving relative URLs."""
-    for _ in range(max_hops):
-        if resp.status_code not in REDIRECT_CODES:
-            break
-        location = resp.headers.get("Location", "")
-        if not location:
-            break
-        location = urljoin(resp.url, location)
-        resp = session.get(location, allow_redirects=False, timeout=HTTP_TIMEOUT)
-    return resp
+def _set_identity(session, auth_token, user_id):
+    """Attach a validated API identity to a session."""
+    session.auth_token = str(auth_token)
+    session.user_id = str(user_id)
+    session.headers["Auth-Token"] = session.auth_token
 
 
-def parse_hidden_fields(html):
-    """Extract all <input type="hidden"> name/value pairs from HTML."""
-    fields = {}
-    for match in re.finditer(
-        r'<input\b[^>]*\btype="hidden"[^>]*/?>',
-        html,
-        re.IGNORECASE,
-    ):
-        tag = match.group()
-        name = re.search(r'\bname="([^"]+)"', tag)
-        value = re.search(r'\bvalue="([^"]*)"', tag)
-        if name and value:
-            fields[name.group(1)] = unescape(value.group(1))
-    return fields
+def _clear_identity(session):
+    session.auth_token = None
+    session.user_id = None
+    session.headers.pop("Auth-Token", None)
 
 
 def save_session(session, path="session.json"):
-    """Save session cookies to a JSON file."""
-    cookies = []
-    for c in session.cookies:
-        cookies.append({
-            "name": c.name,
-            "value": c.value,
-            "domain": c.domain,
-            "path": c.path,
-            "secure": c.secure,
-            "httponly": "HttpOnly" in c._rest,
-        })
-    atomic_write_text(path, json.dumps(cookies, indent=2))
+    """Persist the API token and user ID atomically with private permissions."""
+    auth_token = getattr(session, "auth_token", None)
+    user_id = getattr(session, "user_id", None)
+    if not isinstance(auth_token, str) or not auth_token:
+        raise ValueError("Cannot save a session without an auth token")
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("Cannot save a session without a user ID")
+    payload = {
+        "version": SESSION_VERSION,
+        "auth_token": auth_token,
+        "user_id": user_id,
+    }
+    atomic_write_text(path, json.dumps(payload, indent=2))
 
 
 def load_session(session, path="session.json"):
-    """Load cookies from a JSON file into the session.
-
-    Returns True if cookies were loaded, False if file missing or corrupt.
-    """
+    """Load a v2 API session; legacy cookie arrays deliberately require login."""
     if not os.path.exists(path):
         return False
     try:
-        with open(path) as f:
-            cookies = json.load(f)
+        with open(path, encoding="utf-8") as file:
+            payload = json.load(file)
     except (json.JSONDecodeError, OSError):
         return False
 
-    for c in cookies:
-        cookie = http.cookiejar.Cookie(
-            version=0,
-            name=c["name"],
-            value=c["value"],
-            port=None,
-            port_specified=False,
-            domain=c["domain"],
-            domain_specified=bool(c["domain"]),
-            domain_initial_dot=c["domain"].startswith("."),
-            path=c.get("path", "/"),
-            path_specified=bool(c.get("path")),
-            secure=c.get("secure", False),
-            expires=None,
-            discard=True,
-            comment=None,
-            comment_url=None,
-            rest={"HttpOnly": "HttpOnly"} if c.get("httponly") else {},
-        )
-        session.cookies.set_cookie(cookie)
+    # v1 was a list of web cookies. It cannot authenticate the JSON API.
+    if not isinstance(payload, dict) or payload.get("version") != SESSION_VERSION:
+        return False
+    auth_token = payload.get("auth_token")
+    user_id = payload.get("user_id")
+    if not isinstance(auth_token, str) or not auth_token:
+        return False
+    if not isinstance(user_id, str) or not user_id:
+        return False
+    _set_identity(session, auth_token, user_id)
     return True
 
 
 def verify_authenticated(session):
-    """Check if the session is authenticated using a lightweight endpoint.
+    """Verify a token without misclassifying transient failures as expiry."""
+    request_kwargs = {"timeout": HTTP_TIMEOUT}
+    if isinstance(session, LagetSession):
+        request_kwargs["_laget_skip_reauth"] = True
+    response = session.get(f"{API_URL}/v3/users/me", **request_kwargs)
+    if response.status_code in (401, 403):
+        raise AuthError(f"Session expired - auth check returned {response.status_code}")
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise requests.HTTPError(
+            "Auth check returned an unexpected response",
+            response=response,
+        ) from error
+    if not isinstance(payload, dict):
+        raise requests.HTTPError(
+            "Auth check returned an unexpected response",
+            response=response,
+        )
+    return payload
 
-    GET /common/Notification/notificationcount returns JSON when authenticated,
-    or redirects to login when not.
 
-    Raises AuthError if not authenticated.
-    """
-    resp = session.get(
-        f"{BASE_URL}/common/Notification/notificationcount",
-        allow_redirects=False,
+def _login_with_credentials(session, email, password):
+    response = session.post(
+        f"{API_URL}/v1/session",
+        json={"username": email, "password": password},
         timeout=HTTP_TIMEOUT,
     )
-    if resp.status_code in REDIRECT_CODES:
-        raise AuthError("Session expired - redirected to login")
-    if resp.status_code != 200:
-        raise AuthError(f"Auth check failed with status {resp.status_code}")
+    if response.status_code in (401, 403):
+        raise AuthError("Authentication failed")
+    response.raise_for_status()
     try:
-        resp.json()
-    except ValueError:
-        raise AuthError("Auth check returned unexpected response")
+        payload = response.json()
+    except ValueError as error:
+        raise requests.HTTPError(
+            "Login returned an unexpected response",
+            response=response,
+        ) from error
+
+    auth_token = response.headers.get("auth-token")
+    user_id = payload.get("userId") if isinstance(payload, dict) else None
+    if not auth_token or user_id is None:
+        raise AuthError("Authentication response was incomplete")
+    _set_identity(session, auth_token, user_id)
 
 
 def login(email, password, session_path="session.json", _session=None, deadline_seconds=None):
-    """Log into laget.se with email and password.
-
-    Creates a requests.Session, POSTs credentials to the login form,
-    follows redirects, and verifies authentication.
-
-    Checks session_path for a saved session first. If valid, skips login.
-    On successful login, saves the session to session_path.
-
-    Args:
-        email: User's email address.
-        password: User's password.
-        session_path: Path to session.json for persistence. None to disable.
-        _session: Inject a session for testing. Created if not provided.
-        deadline_seconds: Shared network budget for all authentication requests.
-
-    Returns:
-        Authenticated requests.Session.
-
-    Raises:
-        AuthError: If login fails or session cannot be verified.
-    """
+    """Return an authenticated API session, reauthenticating an expired token once."""
     deadline = (
         time.monotonic() + deadline_seconds
         if deadline_seconds is not None
@@ -194,51 +219,23 @@ def login(email, password, session_path="session.json", _session=None, deadline_
     session = _session or new_session(deadline=deadline)
     if deadline is not None and isinstance(session, LagetSession):
         session.deadline = deadline
+    if isinstance(session, LagetSession):
+        session._email = email
+        session._password = password
+        session._session_path = session_path
 
-    # Try saved session first
     if session_path and load_session(session, session_path):
         try:
             verify_authenticated(session)
             return session
         except AuthError:
-            session = _session or new_session(deadline=deadline)
-            if deadline is not None and isinstance(session, LagetSession):
-                session.deadline = deadline
+            # A definitive 401/403 permits one credential login. The old token
+            # remains safely on disk until the replacement has been verified.
+            _clear_identity(session)
 
-    # Step 1: GET login page to extract CSRF token and hidden fields
-    resp = session.get(
-        f"{BASE_URL}/login",
-        allow_redirects=False,
-        timeout=HTTP_TIMEOUT,
-    )
-    resp = follow_redirects(session, resp)
-    fields = parse_hidden_fields(resp.text)
-
-    token = fields.get("__RequestVerificationToken")
-    if not token:
-        raise AuthError("Failed to extract CSRF token from login page")
-
-    # Step 2: POST login form
-    form_data = {
-        "__RequestVerificationToken": token,
-        "Referer": fields.get("Referer", ""),
-        "Email": email,
-        "Password": password,
-        "KeepAlive": "true",
-    }
-    resp = session.post(
-        f"{BASE_URL}/Login",
-        data=form_data,
-        allow_redirects=False,
-        timeout=HTTP_TIMEOUT,
-    )
-    resp = follow_redirects(session, resp)
-
-    # Step 3: Verify authentication
+    _login_with_credentials(session, email, password)
     verify_authenticated(session)
 
-    # Save session for reuse
     if session_path:
         save_session(session, session_path)
-
     return session

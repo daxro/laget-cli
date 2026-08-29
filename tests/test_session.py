@@ -1,353 +1,400 @@
-import http.cookiejar
 import json
 import os
-import pathlib
 import tempfile
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
-import requests.cookies
 import pytest
+import requests
 
-from laget_cli.session import (
-    LagetSession,
-    follow_redirects,
-    parse_hidden_fields,
-    save_session,
-    load_session,
-    verify_authenticated,
-    login,
-)
 from laget_cli.errors import AuthError
+from laget_cli.session import (
+    API_URL,
+    APP_HEADERS,
+    HTTP_TIMEOUT,
+    LagetSession,
+    load_session,
+    login,
+    new_session,
+    save_session,
+    verify_authenticated,
+)
+
+
+def response(status=200, payload=None, headers=None):
+    result = MagicMock()
+    result.status_code = status
+    result.headers = headers or {}
+    result.json.return_value = {} if payload is None else payload
+    if status >= 400:
+        result.raise_for_status.side_effect = requests.HTTPError(response=result)
+    return result
 
 
 class TestLagetSessionDeadline:
     def test_clamps_each_request_to_remaining_budget(self):
         session = LagetSession(deadline=125)
-        response = MagicMock()
-
         with patch("laget_cli.session.time.monotonic", side_effect=[100, 101, 110, 111]), \
-             patch.object(requests.Session, "request", return_value=response) as request:
+             patch.object(requests.Session, "request", return_value=MagicMock()) as request:
             session.get("https://example.com/one", timeout=30)
             session.get("https://example.com/two", timeout=30)
 
-        first_timeout = request.call_args_list[0].kwargs["timeout"]
-        second_timeout = request.call_args_list[1].kwargs["timeout"]
-        assert first_timeout.total == 25
-        assert first_timeout.connect_timeout == 25
-        assert first_timeout.read_timeout == 25
-        assert second_timeout.total == 15
-        assert second_timeout.connect_timeout == 15
-        assert second_timeout.read_timeout == 15
+        first = request.call_args_list[0].kwargs["timeout"]
+        second = request.call_args_list[1].kwargs["timeout"]
+        assert (first.total, first.connect_timeout, first.read_timeout) == (25, 25, 25)
+        assert (second.total, second.connect_timeout, second.read_timeout) == (15, 15, 15)
 
     def test_raises_before_request_when_budget_is_exhausted(self):
         session = LagetSession(deadline=100)
-
         with patch("laget_cli.session.time.monotonic", return_value=100), \
              patch.object(requests.Session, "request") as request:
             with pytest.raises(requests.Timeout, match="deadline"):
-                session.get("https://example.com", timeout=30)
-
+                session.get("https://example.com")
         request.assert_not_called()
 
     def test_raises_when_request_consumes_remaining_budget(self):
         session = LagetSession(deadline=125)
-
         with patch("laget_cli.session.time.monotonic", side_effect=[100, 125]), \
              patch.object(requests.Session, "request", return_value=MagicMock()):
             with pytest.raises(requests.Timeout, match="deadline"):
-                session.get("https://example.com", timeout=30)
+                session.get("https://example.com")
 
 
-class TestFollowRedirects:
-    def test_follows_302_chain(self):
-        session = MagicMock()
-        r1 = MagicMock(status_code=302, headers={"Location": "https://a.com/step2"}, url="https://a.com/step1")
-        r2 = MagicMock(status_code=302, headers={"Location": "https://b.com/step3"}, url="https://a.com/step2")
-        r3 = MagicMock(status_code=200, headers={}, url="https://b.com/step3")
-        session.get.side_effect = [r2, r3]
-
-        result = follow_redirects(session, r1)
-        assert result.url == "https://b.com/step3"
-        assert session.get.call_count == 2
-
-    def test_stops_on_200(self):
-        session = MagicMock()
-        r1 = MagicMock(status_code=200, headers={}, url="https://a.com")
-        result = follow_redirects(session, r1)
-        assert result.url == "https://a.com"
-        assert session.get.call_count == 0
-
-    def test_resolves_relative_location(self):
-        session = MagicMock()
-        r1 = MagicMock(status_code=302, headers={"Location": "/next"}, url="https://a.com/page")
-        r2 = MagicMock(status_code=200, headers={}, url="https://a.com/next")
-        session.get.return_value = r2
-        result = follow_redirects(session, r1)
-        session.get.assert_called_with("https://a.com/next", allow_redirects=False, timeout=30)
-
-    def test_stops_after_max_hops(self):
-        session = MagicMock()
-        redirect = MagicMock(status_code=302, headers={"Location": "https://a.com/loop"}, url="https://a.com/loop")
-        session.get.return_value = redirect
-        result = follow_redirects(session, redirect, max_hops=5)
-        assert session.get.call_count == 5
-        assert result.status_code == 302
-
-
-class TestParseHiddenFields:
-    def test_parses_multiple_fields(self):
-        html = '''
-        <form action="/Login" method="post">
-            <input type="hidden" name="__RequestVerificationToken" value="abc123">
-            <input type="hidden" name="Referer" value="aHR0cHM6Ly93d3cubGFnZXQuc2Uv">
-        </form>
-        '''
-        fields = parse_hidden_fields(html)
-        assert fields == {
-            "__RequestVerificationToken": "abc123",
-            "Referer": "aHR0cHM6Ly93d3cubGFnZXQuc2Uv",
-        }
-
-    def test_handles_html_entities(self):
-        html = '<input type="hidden" name="token" value="a&amp;b">'
-        fields = parse_hidden_fields(html)
-        assert fields == {"token": "a&b"}
-
-    def test_empty_value(self):
-        html = '<input type="hidden" name="empty" value="">'
-        fields = parse_hidden_fields(html)
-        assert fields == {"empty": ""}
-
-    def test_no_hidden_fields(self):
-        html = '<input type="text" name="Email" value="foo">'
-        fields = parse_hidden_fields(html)
-        assert fields == {}
+class TestNewSession:
+    def test_sets_official_app_headers(self):
+        session = new_session()
+        for name, value in APP_HEADERS.items():
+            assert session.headers[name] == value
+        assert session.auth_token is None
+        assert session.user_id is None
 
 
 class TestVerifyAuthenticated:
-    def test_authenticated_returns_normally(self):
+    def test_uses_me_endpoint_and_returns_json(self):
         session = MagicMock()
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = {"general": 0, "rsvp": 0, "unreadMessages": 0}
-        session.get.return_value = resp
+        session.get.return_value = response(payload={"id": 123})
+        assert verify_authenticated(session) == {"id": 123}
+        session.get.assert_called_once_with(f"{API_URL}/v3/users/me", timeout=HTTP_TIMEOUT)
 
-        verify_authenticated(session)
-        assert session.get.call_count == 1
-
-    def test_redirect_raises_auth_error(self):
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_auth_status_raises_auth_error(self, status):
         session = MagicMock()
-        resp = MagicMock()
-        resp.status_code = 302
-        resp.headers = {"Location": "https://www.laget.se/login"}
-        session.get.return_value = resp
-
-        with pytest.raises(AuthError, match="expired|redirect"):
+        session.get.return_value = response(status=status)
+        with pytest.raises(AuthError, match=str(status)):
             verify_authenticated(session)
 
-    def test_non_200_raises_auth_error(self):
+    def test_server_error_remains_http_error(self):
         session = MagicMock()
-        resp = MagicMock()
-        resp.status_code = 500
-        session.get.return_value = resp
-
-        with pytest.raises(AuthError):
+        session.get.return_value = response(status=503)
+        with pytest.raises(requests.HTTPError):
             verify_authenticated(session)
 
-    def test_non_json_raises_auth_error(self):
+    def test_non_json_remains_http_error(self):
         session = MagicMock()
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.side_effect = ValueError("not json")
-        session.get.return_value = resp
-
-        with pytest.raises(AuthError):
+        result = response()
+        result.json.side_effect = ValueError("not json")
+        session.get.return_value = result
+        with pytest.raises(requests.HTTPError):
             verify_authenticated(session)
 
 
 class TestSessionPersistence:
-    def test_save_creates_parent_dirs(self):
+    def test_save_and_load_v2_roundtrip_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "nested", "deep", "session.json")
-            session = MagicMock()
-            jar = __import__("requests").cookies.RequestsCookieJar()
-            session.cookies = jar
-            save_session(session, path)
-            assert os.path.exists(path)
+            path = os.path.join(tmpdir, "nested", "session.json")
+            session = new_session()
+            session.auth_token = "secret-token"
+            session.user_id = "123"
+            session.headers["Auth-Token"] = session.auth_token
 
-    def test_save_and_load_roundtrip(self):
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            path = f.name
+            save_session(session, path)
+            assert os.stat(path).st_mode & 0o777 == 0o600
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file) == {
+                    "version": 2,
+                    "auth_token": "secret-token",
+                    "user_id": "123",
+                }
+
+            loaded = new_session()
+            assert load_session(loaded, path) is True
+            assert loaded.auth_token == "secret-token"
+            assert loaded.user_id == "123"
+            assert loaded.headers["Auth-Token"] == "secret-token"
+
+    def test_legacy_cookie_array_requires_reauthentication(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            json.dump([{"name": "auth", "value": "old-cookie"}], file)
+            path = file.name
         try:
-            session = MagicMock()
-            cookie = http.cookiejar.Cookie(
-                version=0, name="laget_auth", value="abc123",
-                port=None, port_specified=False,
-                domain=".laget.se", domain_specified=True,
-                domain_initial_dot=True,
-                path="/", path_specified=True,
-                secure=True, expires=None, discard=True,
-                comment=None, comment_url=None,
-                rest={"HttpOnly": "HttpOnly"},
-            )
-            jar = requests.cookies.RequestsCookieJar()
-            jar.set_cookie(cookie)
-            session.cookies = jar
+            session = new_session()
+            assert load_session(session, path) is False
+            assert session.auth_token is None
+            assert "Auth-Token" not in session.headers
+        finally:
+            os.unlink(path)
 
-            save_session(session, path)
-            assert os.path.exists(path)
-
-            # Verify file permissions
-            stat = os.stat(path)
-            assert stat.st_mode & 0o777 == 0o600
-
-            new_sess = MagicMock()
-            new_sess.cookies = requests.cookies.RequestsCookieJar()
-            load_session(new_sess, path)
-            assert any(c.name == "laget_auth" for c in new_sess.cookies)
+    @pytest.mark.parametrize("content", ["not json", "{}", '{"version":2}'])
+    def test_invalid_session_returns_false(self, content):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            file.write(content)
+            path = file.name
+        try:
+            assert load_session(new_session(), path) is False
         finally:
             os.unlink(path)
 
     def test_load_nonexistent_returns_false(self):
-        session = MagicMock()
-        result = load_session(session, "/nonexistent/path.json")
-        assert result is False
-
-    def test_load_corrupt_json_returns_false(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write("not json")
-            path = f.name
-        try:
-            session = MagicMock()
-            result = load_session(session, path)
-            assert result is False
-        finally:
-            os.unlink(path)
+        assert load_session(new_session(), "/nonexistent/path/session.json") is False
 
 
 class TestLogin:
-    def _mock_login_flow(self):
-        """Build a mock session that simulates the laget.se login flow."""
-        session = MagicMock()
-        session.headers = {}
+    def test_login_posts_json_sets_identity_verifies_and_saves(self):
+        session = new_session()
+        session.post = MagicMock(return_value=response(
+            payload={"userId": 123}, headers={"auth-token": "new-token"}
+        ))
+        session.get = MagicMock(return_value=response(payload={"id": 123}))
 
-        # Step 1: GET /login -> login page with CSRF token
-        login_page_resp = MagicMock()
-        login_page_resp.status_code = 200
-        login_page_resp.headers = {}
-        login_page_resp.url = "https://www.laget.se/login"
-        login_page_resp.text = '''
-        <form action="/Login" method="post" id="login-form">
-            <input type="hidden" name="__RequestVerificationToken" value="csrf_token_123">
-            <input type="hidden" name="Referer" value="aHR0cHM6Ly93d3cubGFnZXQuc2Uv">
-            <input type="text" name="Email" placeholder="E-postadress">
-            <input type="password" name="Password" placeholder="Lösenord">
-        </form>
-        '''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "session.json")
+            assert login("test@example.com", "password", path, _session=session) is session
+            session.post.assert_called_once_with(
+                f"{API_URL}/v1/session",
+                json={"username": "test@example.com", "password": "password"},
+                timeout=HTTP_TIMEOUT,
+            )
+            assert session.headers["Auth-Token"] == "new-token"
+            assert session.auth_token == "new-token"
+            assert session.user_id == "123"
+            assert os.path.exists(path)
 
-        # Step 2: POST /Login -> redirect to home
-        post_resp = MagicMock()
-        post_resp.status_code = 302
-        post_resp.headers = {"Location": "https://www.laget.se/"}
-        post_resp.url = "https://www.laget.se/Login"
-
-        home_resp = MagicMock()
-        home_resp.status_code = 200
-        home_resp.headers = {}
-        home_resp.url = "https://www.laget.se/"
-        home_resp.text = "<html>Home</html>"
-
-        # Step 3: verify_authenticated -> notification count
-        auth_check_resp = MagicMock()
-        auth_check_resp.status_code = 200
-        auth_check_resp.json.return_value = {"general": 0, "rsvp": 0, "unreadMessages": 0}
-
-        session.get.side_effect = [
-            login_page_resp,   # GET /login
-            home_resp,         # follow_redirects after POST
-            auth_check_resp,   # verify_authenticated
-        ]
-        session.post.return_value = post_resp
-
-        return session
-
-    def test_login_returns_session(self):
-        session = self._mock_login_flow()
-        result = login("test@example.com", "password123", session_path=None, _session=session)
-        assert result is session
-
-    def test_login_posts_credentials(self):
-        session = self._mock_login_flow()
-        login("test@example.com", "password123", session_path=None, _session=session)
-
-        session.post.assert_called_once()
-        call_args = session.post.call_args
-        assert call_args[1]["data"]["Email"] == "test@example.com"
-        assert call_args[1]["data"]["Password"] == "password123"
-        assert call_args[1]["data"]["__RequestVerificationToken"] == "csrf_token_123"
-        assert call_args[1]["data"]["KeepAlive"] == "true"
-
-    def test_login_raises_on_missing_csrf(self):
-        session = MagicMock()
-        session.headers = {}
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.headers = {}
-        resp.url = "https://www.laget.se/login"
-        resp.text = "<html>No hidden fields</html>"
-        session.get.return_value = resp
-
-        with pytest.raises(AuthError, match="CSRF"):
-            login("test@example.com", "pass", session_path=None, _session=session)
-
-    def test_login_reuses_saved_session(self):
-        """If saved session is valid, skip login."""
-        session = MagicMock()
-        session.headers = {}
-
-        auth_check_resp = MagicMock()
-        auth_check_resp.status_code = 200
-        auth_check_resp.json.return_value = {"general": 0}
-        session.get.return_value = auth_check_resp
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump([{
-                "name": "auth",
-                "value": "valid",
-                "domain": ".laget.se",
-                "path": "/",
-                "secure": True,
-                "httponly": True,
-            }], f)
-            path = f.name
-
+    def test_valid_saved_token_skips_login(self):
+        session = new_session()
+        session.post = MagicMock()
+        session.get = MagicMock(return_value=response(payload={"id": 123}))
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            json.dump({
+                "version": 2,
+                "auth_token": "saved-token",
+                "user_id": "123",
+            }, file)
+            path = file.name
         try:
-            result = login("test@example.com", "pass", session_path=path, _session=session)
-            assert result is session
-            # Should NOT have called POST (no login needed)
-            assert session.post.call_count == 0
+            assert login("test@example.com", "password", path, _session=session) is session
+            session.post.assert_not_called()
+            assert session.headers["Auth-Token"] == "saved-token"
         finally:
             os.unlink(path)
 
-    def test_reauthentication_preserves_original_deadline(self):
-        expired_session = MagicMock()
-        expired_response = MagicMock(status_code=302)
-        expired_session.get.return_value = expired_response
+    def test_expired_saved_token_reauthenticates_once_and_replaces_file(self):
+        session = new_session()
+        session.get = MagicMock(side_effect=[
+            response(status=401),
+            response(payload={"id": 123}),
+        ])
+        session.post = MagicMock(return_value=response(
+            payload={"userId": 123}, headers={"auth-token": "replacement"}
+        ))
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            json.dump({
+                "version": 2,
+                "auth_token": "expired",
+                "user_id": "123",
+            }, file)
+            path = file.name
+        try:
+            login("test@example.com", "password", path, _session=session)
+            session.post.assert_called_once()
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file)["auth_token"] == "replacement"
+        finally:
+            os.unlink(path)
 
-        login_session = self._mock_login_flow()
-        with patch("laget_cli.session.time.monotonic", return_value=100), \
-             patch("laget_cli.session.new_session", side_effect=[expired_session, login_session]) as new_session, \
-             patch("laget_cli.session.load_session", return_value=True), \
-             patch("laget_cli.session.save_session"):
-            result = login(
-                "test@example.com",
-                "password123",
-                session_path="session.json",
-                deadline_seconds=25,
+    def test_saved_session_server_error_does_not_attempt_login_or_replace_token(self):
+        session = new_session()
+        session.get = MagicMock(return_value=response(status=503))
+        session.post = MagicMock()
+        original = {
+            "version": 2,
+            "auth_token": "still-valid",
+            "user_id": "123",
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            json.dump(original, file)
+            path = file.name
+        try:
+            with pytest.raises(requests.HTTPError):
+                login("test@example.com", "password", path, _session=session)
+            session.post.assert_not_called()
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file) == original
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_bad_credentials_raise_auth_without_retry(self, status):
+        session = new_session()
+        session.post = MagicMock(return_value=response(status=status))
+        session.get = MagicMock()
+        with pytest.raises(AuthError, match="Authentication failed"):
+            login("test@example.com", "wrong", session_path=None, _session=session)
+        session.post.assert_called_once()
+        session.get.assert_not_called()
+
+    def test_incomplete_login_response_is_auth_error(self):
+        session = new_session()
+        session.post = MagicMock(return_value=response(payload={"userId": 123}))
+        with pytest.raises(AuthError, match="incomplete"):
+            login("test@example.com", "password", session_path=None, _session=session)
+
+
+class TestAutomaticReauthentication:
+    def _authenticated_session(self, session_path=None):
+        session = new_session()
+        session._email = "test@example.com"
+        session._password = "password"
+        session._session_path = session_path
+        session.auth_token = "expired"
+        session.user_id = "123"
+        session.headers["Auth-Token"] = "expired"
+        return session
+
+    def test_401_reauthenticates_verifies_saves_then_replays_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "session.json")
+            session = self._authenticated_session(path)
+            original_401 = response(status=401)
+            login_ok = response(
+                payload={"userId": 123}, headers={"auth-token": "replacement"}
+            )
+            verify_ok = response(payload={"id": 123})
+            replay_ok = response(payload={"items": []})
+
+            with patch.object(
+                requests.Session,
+                "request",
+                side_effect=[original_401, login_ok, verify_ok, replay_ok],
+            ) as raw_request:
+                result = session.get(
+                    f"{API_URL}/v4/users/123/teams",
+                    params={"include": "active"},
+                    timeout=17,
+                )
+
+            assert result is replay_ok
+            assert raw_request.call_count == 4
+            first = raw_request.call_args_list[0]
+            replay = raw_request.call_args_list[3]
+            assert first.args == replay.args
+            assert first.kwargs == replay.kwargs
+            assert raw_request.call_args_list[1].args == ("POST", f"{API_URL}/v1/session")
+            assert raw_request.call_args_list[2].args == ("GET", f"{API_URL}/v3/users/me")
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file)["auth_token"] == "replacement"
+
+    def test_mutating_json_request_is_replayed_once_with_identical_body(self):
+        session = self._authenticated_session()
+        denied = response(status=401)
+        login_ok = response(
+            payload={"userId": 123}, headers={"auth-token": "replacement"}
+        )
+        verify_ok = response(payload={"id": 123})
+        replay_ok = response(payload={"saved": True})
+        body = {
+            "siteId": 456,
+            "attending": True,
+            "answer": "yes",
+            "reason": "Kommer",
+        }
+
+        with patch.object(
+            requests.Session,
+            "request",
+            side_effect=[denied, login_ok, verify_ok, replay_ok],
+        ) as raw_request:
+            result = session.put(
+                f"{API_URL}/v1/events/789/rsvp/123",
+                json=body,
+                timeout=HTTP_TIMEOUT,
             )
 
-        assert result is login_session
-        assert new_session.call_args_list == [
-            call(deadline=125),
-            call(deadline=125),
+        assert result is replay_ok
+        assert raw_request.call_count == 4
+        first_body = raw_request.call_args_list[0].kwargs["json"]
+        replay_body = raw_request.call_args_list[3].kwargs["json"]
+        assert first_body == replay_body == body
+
+    def test_permission_403_is_not_reauthenticated_or_replayed(self):
+        session = self._authenticated_session()
+        denied = response(status=403)
+        with patch.object(
+            requests.Session, "request", return_value=denied
+        ) as raw_request:
+            result = session.put(
+                f"{API_URL}/v1/events/789/rsvp/123",
+                json={"attending": 1},
+            )
+        assert result is denied
+        raw_request.assert_called_once()
+
+    def test_replayed_401_does_not_reauthenticate_again(self):
+        session = self._authenticated_session()
+        responses = [
+            response(status=401),
+            response(payload={"userId": 123}, headers={"auth-token": "replacement"}),
+            response(payload={"id": 123}),
+            response(status=401),
         ]
+        with patch.object(requests.Session, "request", side_effect=responses) as raw_request:
+            with pytest.raises(AuthError, match="after token refresh"):
+                session.get(f"{API_URL}/v4/users/123/teams")
+        assert raw_request.call_count == 4
+
+    def test_transient_response_does_not_reauthenticate_or_change_disk_token(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            original = {
+                "version": 2,
+                "auth_token": "still-valid",
+                "user_id": "123",
+            }
+            json.dump(original, file)
+            path = file.name
+        try:
+            session = self._authenticated_session(path)
+            with patch.object(
+                requests.Session, "request", return_value=response(status=503)
+            ) as raw_request:
+                result = session.get(f"{API_URL}/v4/users/123/teams")
+            assert result.status_code == 503
+            assert raw_request.call_count == 1
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file) == original
+        finally:
+            os.unlink(path)
+
+    def test_failed_reauth_verification_keeps_disk_token_and_does_not_replay(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+            original = {
+                "version": 2,
+                "auth_token": "expired",
+                "user_id": "123",
+            }
+            json.dump(original, file)
+            path = file.name
+        try:
+            session = self._authenticated_session(path)
+            responses = [
+                response(status=401),
+                response(payload={"userId": 123}, headers={"auth-token": "candidate"}),
+                response(status=503),
+            ]
+            with patch.object(
+                requests.Session, "request", side_effect=responses
+            ) as raw_request:
+                with pytest.raises(requests.HTTPError):
+                    session.get(f"{API_URL}/v4/users/123/teams")
+            assert raw_request.call_count == 3
+            with open(path, encoding="utf-8") as file:
+                assert json.load(file) == original
+        finally:
+            os.unlink(path)

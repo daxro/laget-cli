@@ -1,121 +1,110 @@
-"""laget.se teams and children API."""
+"""laget.se team resources from the mobile JSON API."""
 
-import re
-from html import unescape
+from urllib.parse import urlparse
 
 from laget_cli.errors import ParseError
-from laget_cli.session import AJAX_HEADERS, BASE_URL, HTTP_TIMEOUT
+from laget_cli.session import API_URL, HTTP_TIMEOUT
+
+
+def _resource_id(value):
+    """Return a stable string ID, or ``None`` for a missing value."""
+    return None if value is None else str(value)
+
+
+def _slug_from_page_url(url):
+    """Extract the first path segment from a laget.se page URL."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url.strip())
+    path = parsed.path if parsed.scheme or parsed.netloc else url.strip().split("?", 1)[0]
+    parts = [part for part in path.split("/") if part]
+    return parts[0] if parts else None
+
+
+def _json_object(response, resource):
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ParseError(f"Invalid JSON returned for {resource}") from exc
+    if not isinstance(payload, dict):
+        raise ParseError(f"Expected a JSON object for {resource}")
+    return payload
 
 
 def fetch_teams(session):
-    """Fetch the user's teams from /Common/UserMenu/Pages.
+    """Fetch and join the authenticated user's teams and pages.
 
-    Returns a list of dicts: [{"name": ..., "club": ..., "team_slug": ...}]
+    The mobile API exposes display metadata and page URLs separately. Internal
+    keys prefixed with ``_`` are retained so command handlers can address other
+    API resources without exposing them in the public CLI contract.
     """
-    resp = session.get(
-        f"{BASE_URL}/Common/UserMenu/Pages",
-        headers=AJAX_HEADERS,
+    user_id = session.user_id
+    teams_response = session.get(
+        f"{API_URL}/v4/users/{user_id}/teams",
         timeout=HTTP_TIMEOUT,
     )
-    resp.raise_for_status()
-    return _parse_teams(resp.text)
-
-
-def fetch_children(session):
-    """Fetch the user's children from /User/Children.
-
-    Returns a list of dicts: [{"name": ..., "id": ...}]
-    """
-    resp = session.get(
-        f"{BASE_URL}/User/Children",
-        params={"returnUrl": "http://www.laget.se/"},
-        headers=AJAX_HEADERS,
+    teams_response.raise_for_status()
+    pages_response = session.get(
+        f"{API_URL}/v4/users/{user_id}/pages",
         timeout=HTTP_TIMEOUT,
     )
-    resp.raise_for_status()
-    return _parse_children(resp.text)
+    pages_response.raise_for_status()
 
+    teams_payload = _json_object(teams_response, "teams")
+    pages_payload = _json_object(pages_response, "pages")
+    raw_teams = teams_payload.get("teams")
+    raw_pages = pages_payload.get("pages")
+    if not isinstance(raw_teams, list) or not isinstance(raw_pages, list):
+        raise ParseError("Team API response is missing teams or pages")
 
-def _parse_teams(html):
-    """Parse team list HTML from /Common/UserMenu/Pages.
-
-    Extracts team name, club name, and URL slug from the popover list HTML.
-    """
+    pages_by_id = {
+        _resource_id(page.get("id")): page
+        for page in raw_pages
+        if isinstance(page, dict) and page.get("id") is not None
+    }
     teams = []
-    for match in re.finditer(
-        r'<a\s+class="popoverList__contentWrapper"\s+href="([^"]*)">'
-        r'[\s\S]*?'
-        r'<p\s+class="popoverList__name"><b>(.*?)</b></p>'
-        r'[\s\S]*?'
-        r'<small\s+class="popoverList__club">(.*?)</small>',
-        html,
-    ):
-        url = match.group(1).strip()
-        url_slug = url.rstrip("/").rsplit("/", 1)[-1]
-        name = unescape(match.group(2).strip())
-        club = unescape(match.group(3).strip())
-        teams.append({"name": name, "club": club, "team_slug": url_slug})
-
-    if not teams and "popoverList" in html:
-        raise ParseError("Found popoverList HTML but failed to parse any teams from /Common/UserMenu/Pages")
-
+    for raw_team in raw_teams:
+        if not isinstance(raw_team, dict):
+            continue
+        site_id = _resource_id(raw_team.get("id"))
+        page = pages_by_id.get(site_id, {})
+        page_url = page.get("url") if isinstance(page, dict) else None
+        parent_site = raw_team.get("parentSite")
+        club = (
+            parent_site.get("displayName")
+            if isinstance(parent_site, dict)
+            else raw_team.get("displayName")
+        )
+        teams.append(
+            {
+                "name": raw_team.get("displayName"),
+                "club": club,
+                "team_slug": _slug_from_page_url(page_url),
+                "_site_id": site_id,
+                "_page_url": page_url,
+            }
+        )
     return teams
 
 
-def _parse_children(html):
-    """Parse children list HTML from /User/Children.
-
-    Extracts child ID from ShowChildProfileSettings('id') and
-    child name from adjacent text content.
-    """
-    children = []
-    for match in re.finditer(
-        r"ShowChildProfileSettings\('(\d+)'\).*?>(.*?)</a>",
-        html,
-        re.DOTALL,
-    ):
-        child_id = match.group(1)
-        raw_name = match.group(2)
-        name = re.sub(r"<[^>]+>", "", raw_name).strip()
-        if child_id and name:
-            children.append({"name": name, "id": child_id})
-
-    return children
-
-
-def fetch_roster_member_ids(session, team_slug):
-    """Fetch member IDs from a team's roster page.
-
-    Returns a set of member ID strings extracted from /Troop/{memberId}/ links.
-    """
-    resp = session.get(
-        f"{BASE_URL}/{team_slug}/Troop",
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return set(re.findall(r"/Troop/(\d+)/", resp.text))
+def fetch_children(session):
+    """Return no children because the mobile API has no child-list resource."""
+    return []
 
 
 def sync_child_team_mapping(session, teams, children):
-    """Build a child-to-team mapping by checking each team's roster.
-
-    Returns a dict: {child_id: team_slug} for each child found on a team.
-    """
-    child_ids = {c["id"] for c in children}
-    mapping = {}
-    for team in teams:
-        if mapping.keys() >= child_ids:
-            break
-        member_ids = fetch_roster_member_ids(session, team["team_slug"])
-        for child_id in child_ids:
-            if child_id in member_ids:
-                mapping[child_id] = team["team_slug"]
-    return mapping
+    """Return an empty mapping; roster HTML is deliberately not consulted."""
+    return {}
 
 
 def filter_teams_by_club(teams, club_filter):
-    """Filter teams by club name (case-insensitive substring match)."""
+    """Filter teams by club name using a case-insensitive substring match."""
     if not club_filter:
         return teams
-    lower_filter = club_filter.lower()
-    return [t for t in teams if lower_filter in t["club"].lower()]
+    lower_filter = club_filter.casefold()
+    return [
+        team
+        for team in teams
+        if isinstance(team.get("club"), str)
+        and lower_filter in team["club"].casefold()
+    ]

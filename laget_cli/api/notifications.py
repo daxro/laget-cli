@@ -1,183 +1,151 @@
-"""laget.se notifications API."""
+"""Authenticated content feed from the laget.se mobile JSON API.
 
-import re
-from html import unescape
+The mobile API does not expose the website's legacy notification list. The
+``notifications`` command therefore consumes the authenticated news feed.
+"""
 
-from laget_cli.api.normalize import _infer_notification_type
-from laget_cli.session import AJAX_HEADERS, BASE_URL, HTTP_TIMEOUT
+from urllib.parse import urlparse
 
-# Full Swedish month names to numbers, as used in tooltip title attributes
-_SWEDISH_MONTH_NAMES = {
-    "januari": 1,
-    "februari": 2,
-    "mars": 3,
-    "april": 4,
-    "maj": 5,
-    "juni": 6,
-    "juli": 7,
-    "augusti": 8,
-    "september": 9,
-    "oktober": 10,
-    "november": 11,
-    "december": 12,
-}
+from laget_cli.api.normalize import _normalize_json_datetime, _strip_html
+from laget_cli.errors import ParseError
+from laget_cli.session import API_URL, HTTP_TIMEOUT
 
 
-def fetch_notifications(session):
-    """Fetch the user's notifications from /Common/Notification/GetNotifications.
-
-    Returns a list of notification dicts.
-    """
-    resp = session.get(
-        f"{BASE_URL}/Common/Notification/GetNotifications",
-        headers=AJAX_HEADERS,
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return _parse_notifications(resp.text)
+def _string_id(value):
+    return None if value is None else str(value)
 
 
-def _parse_date_from_tooltip(title_attr):
-    """Parse date from tooltip title attribute like 'den 25 mars 2026 21:43'.
-
-    Returns ISO datetime string 'YYYY-MM-DDTHH:MM:SS' or None.
-    """
-    if not title_attr:
+def _display_name(value):
+    if not isinstance(value, dict):
         return None
-    m = re.search(
-        r"den\s+(\d{1,2})\s+([a-zåäö]+)\s+(\d{4})\s+(\d{1,2}:\d{2})",
-        title_attr.strip(),
-        re.IGNORECASE,
-    )
-    if m:
-        day = int(m.group(1))
-        month_name = m.group(2).lower()
-        year = int(m.group(3))
-        time_str = m.group(4)
-        month = _SWEDISH_MONTH_NAMES.get(month_name)
-        if month:
-            return f"{year:04d}-{month:02d}-{day:02d}T{time_str}:00"
-    return None
+    display_names = value.get("displayNames")
+    if isinstance(display_names, dict):
+        return display_names.get("long") or display_names.get("short")
+    return value.get("displayName") or value.get("name")
 
 
-def _extract_team_slug_from_url(href):
-    """Extract team slug from a full or relative laget.se URL.
+def _slug_from_url(url):
+    if not isinstance(url, str) or not url:
+        return None
+    parsed = urlparse(url)
+    path = parsed.path if parsed.scheme or parsed.netloc else url
+    parts = [part for part in path.split("/") if part]
+    return parts[0] if parts else None
 
-    https://www.laget.se/TeamSlug/... -> 'TeamSlug'
-    /TeamSlug/... -> 'TeamSlug'
+
+def _publisher_name(item):
+    publisher = item.get("publisher")
+    if not isinstance(publisher, dict):
+        return None
+    if item.get("showPublisher") is False:
+        return None
+    return publisher.get("name") or publisher.get("displayName")
+
+
+def _normalize_feed_item(item):
+    """Normalize one native feed item while retaining its native semantics."""
+    if not isinstance(item, dict):
+        return None
+    site = item.get("site") if isinstance(item.get("site"), dict) else {}
+    url = item.get("url")
+    return {
+        "id": _string_id(item.get("id")),
+        "type": item.get("type") or "unknown",
+        "title": item.get("title"),
+        "body": _strip_html(item.get("content") or item.get("description")),
+        "date": _normalize_json_datetime(item.get("date")),
+        "author": _publisher_name(item),
+        "comment_count": item.get("numComments", 0),
+        "site_id": _string_id(site.get("id")),
+        "site_name": _display_name(site),
+        "team": None,
+        "team_slug": _slug_from_url(url or site.get("url")),
+        "url": url,
+    }
+
+
+def fetch_feed(session, limit=None, max_pages=20, page_size=50, since=None):
+    """Fetch a bounded, deduplicated set of authenticated feed items.
+
+    ``since`` may be an ISO date or timestamp. It is only used for an early
+    stop when a page is demonstrably sorted newest-first; callers remain
+    responsible for applying their exact date filter.
     """
-    # Strip base URL if present
-    path = href
-    if "laget.se/" in href:
-        path = href.split("laget.se", 1)[1]
-    path = path.lstrip("/")
-    parts = path.split("/")
-    if parts:
-        return parts[0]
-    return None
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    if page_size < 1 or page_size > 50:
+        raise ValueError("page_size must be between 1 and 50")
+    if limit == 0:
+        return []
 
-
-def _extract_relative_url(href):
-    """Convert absolute laget.se URL to relative path.
-
-    https://www.laget.se/TeamSlug/News/1234 -> /TeamSlug/News/1234
-    /TeamSlug/... -> /TeamSlug/...
-    """
-    if "laget.se" in href:
-        path = href.split("laget.se", 1)[1]
-        if not path.startswith("/"):
-            path = "/" + path
-        return path
-    return href
-
-
-def _parse_notifications(html):
-    """Parse notification HTML fragment from /Common/Notification/GetNotifications.
-
-    Expects HTML with the structure:
-      <ul class="popoverList">
-        <li class="popoverList__itemOuter">
-          <a ... href="https://www.laget.se/{team_slug}/...">
-            <img ... alt="Author Name">
-            <b>Author Name</b> action text
-            <small class="popoverList__info">
-              ...
-              <span class="tooltip" title="den DD month YYYY HH:MM">...</span>
-              ...
-            </small>
-          </a>
-        </li>
-      </ul>
-
-    Returns a list of notification dicts.
-    """
-    notifications = []
-
-    for li_match in re.finditer(
-        r'<li\s+class="popoverList__itemOuter"[^>]*>([\s\S]*?)</li>',
-        html,
-    ):
-        li_html = li_match.group(1)
-
-        # Extract href from <a> tag
-        href_match = re.search(r'<a\b[^>]+href="([^"]+)"', li_html)
-        if not href_match:
-            continue
-        href = href_match.group(1).strip()
-
-        # Extract author from <b> tag
-        author_match = re.search(r"<b>([^<]+)</b>", li_html)
-        author = unescape(author_match.group(1).strip()) if author_match else None
-
-        # Extract action title text (between </b> and <small)
-        title_match = re.search(r"</b>([\s\S]*?)<small", li_html)
-        title = None
-        if title_match:
-            raw_title = re.sub(r"<[^>]+>", "", title_match.group(1)).strip()
-            title = unescape(raw_title) if raw_title else None
-
-        # Extract date from tooltip title attribute
-        tooltip_match = re.search(
-            r'<span\s+class="tooltip"\s+title="([^"]+)"',
-            li_html,
+    results = []
+    seen = set()
+    since_date = str(since)[:10] if since is not None else None
+    for page_index in range(max_pages):
+        response = session.get(
+            f"{API_URL}/v5/users/{session.user_id}/news",
+            params={
+                "pageIndex": page_index,
+                "pageSize": page_size,
+                "excerptLength": 100,
+            },
+            timeout=HTTP_TIMEOUT,
         )
-        date_str = _parse_date_from_tooltip(
-            tooltip_match.group(1) if tooltip_match else None
-        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ParseError("Invalid JSON returned for content feed") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("news"), list):
+            raise ParseError("Content feed response is missing news")
 
-        relative_url = _extract_relative_url(href)
-        team_slug = _extract_team_slug_from_url(href)
+        raw_items = payload["news"]
+        page_dates = []
+        for raw_item in raw_items:
+            item = _normalize_feed_item(raw_item)
+            if item is None:
+                continue
+            key = (item["type"], item["id"], item["site_id"])
+            if key not in seen:
+                seen.add(key)
+                results.append(item)
+                if limit is not None and len(results) >= limit:
+                    return results[:limit]
+            if item["date"]:
+                page_dates.append(item["date"][:10])
 
-        # Infer type from URL; refine news -> news_comment if action text says "kommenterade"
-        notification_type = _infer_notification_type(relative_url)
-        if notification_type == "news" and title and "kommentera" in title.lower():
-            notification_type = "news_comment"
+        if not raw_items or len(raw_items) < page_size:
+            break
+        is_descending = page_dates == sorted(page_dates, reverse=True)
+        if since_date and page_dates and is_descending and page_dates[-1] < since_date:
+            break
+    return results
 
-        notifications.append(
-            {
-                "date": date_str,
-                "type": notification_type,
-                "author": author,
-                "title": title,
-                "team": None,  # resolved by caller using teams list
-                "team_slug": team_slug,
-                "url": relative_url,
-            }
-        )
 
-    return notifications
+def fetch_notifications(session, **kwargs):
+    """Compatibility name for the content feed used by the CLI command."""
+    return fetch_feed(session, **kwargs)
 
 
 def resolve_team_names(notifications, teams):
-    """Fill in the 'team' field for each notification using a teams list.
-
-    Args:
-        notifications: list of notification dicts (team field is None)
-        teams: list of team dicts with 'team_slug' and 'name' keys
-
-    Returns the same list with 'team' fields populated where possible.
-    """
-    slug_to_name = {t["team_slug"]: t["name"] for t in teams}
-    for n in notifications:
-        n["team"] = slug_to_name.get(n["team_slug"])
+    """Resolve feed site IDs to the CLI team's display name and slug."""
+    by_site_id = {
+        _string_id(team.get("_site_id")): team
+        for team in teams
+        if team.get("_site_id") is not None
+    }
+    by_slug = {
+        team.get("team_slug"): team
+        for team in teams
+        if team.get("team_slug")
+    }
+    for item in notifications:
+        team = by_site_id.get(_string_id(item.get("site_id")))
+        if team is None:
+            team = by_slug.get(item.get("team_slug"))
+        if team is not None:
+            item["team"] = team.get("name")
+            item["team_slug"] = team.get("team_slug")
     return notifications

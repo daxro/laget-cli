@@ -224,6 +224,27 @@ class TestStatusCommand:
         assert "T1 (Test FK)" in out
         assert "Alice" in out
 
+    @patch("laget_cli.cli._sync_state")
+    @patch("laget_cli.cli.fetch_children")
+    @patch("laget_cli.cli.fetch_teams")
+    @patch("laget_cli.cli.login", return_value=MagicMock())
+    @patch("laget_cli.cli.dotenv_values", return_value={"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "p"})
+    def test_status_teams_field_skips_child_and_roster_enrichment(
+        self, mock_dotenv, mock_login, mock_fetch_teams, mock_fetch_children, mock_sync, capsys
+    ):
+        mock_fetch_teams.return_value = [
+            {"name": "T1", "club": "Test FK", "team_slug": "test-t1"}
+        ]
+
+        with patch("sys.argv", ["laget", "-q", "status", "--json", "--fields", "teams"]):
+            main()
+
+        assert json.loads(capsys.readouterr().out) == {
+            "teams": [{"name": "T1", "club": "Test FK", "team_slug": "test-t1"}]
+        }
+        mock_fetch_children.assert_not_called()
+        mock_sync.assert_not_called()
+
     @patch("laget_cli.cli.dotenv_values")
     def test_status_not_configured_outputs_json(self, mock_dotenv, capsys):
         mock_dotenv.return_value = {}
@@ -564,18 +585,19 @@ class TestGetStatusExceptionHandling:
         with pytest.raises(requests.Timeout):
             _get_status()
 
-    def test_roster_sync_timeout_propagates(self):
+    def test_roster_sync_timeout_is_best_effort(self):
         from laget_cli.cli import _sync_state
 
         with patch("laget_cli.cli.sync_child_team_mapping", side_effect=requests.Timeout()):
-            with pytest.raises(requests.Timeout):
-                _sync_state(
-                    MagicMock(),
-                    {},
-                    teams=[{"name": "T1", "club": "C", "team_slug": "a"}],
-                    children=[{"name": "Alice", "id": "1"}],
-                    quiet=True,
-                )
+            state = _sync_state(
+                MagicMock(),
+                {},
+                teams=[{"name": "T1", "club": "C", "team_slug": "a"}],
+                children=[{"name": "Alice", "id": "1"}],
+                quiet=True,
+            )
+
+        assert state is None
 
 
 
@@ -789,6 +811,27 @@ class TestAgentSafetyContracts:
         assert status["teams"] == []
         assert status["children"] == []
 
+    def test_status_keeps_teams_when_roster_sync_times_out(self):
+        from laget_cli.cli import _get_status
+
+        teams = [{"name": "P2021", "club": "Club", "team_slug": "Club-P2021"}]
+        children = [{"name": "Alice", "id": "123"}]
+        cached = {
+            "child_teams": {
+                "123": {"team_slug": "Club-P2021", "team_name": "P2021"}
+            }
+        }
+        config = {"LAGET_EMAIL": "t@t.com", "LAGET_PASSWORD": "pw"}
+
+        with patch("laget_cli.cli.fetch_teams", return_value=teams), \
+             patch("laget_cli.cli.fetch_children", return_value=children), \
+             patch("laget_cli.cli.sync_child_team_mapping", side_effect=requests.Timeout()), \
+             patch("laget_cli.cli._load_state", return_value=cached):
+            status = _get_status(session=MagicMock(), config=config)
+
+        assert status["teams"] == teams
+        assert status["children"][0]["team_slug"] == "Club-P2021"
+
     def test_ambiguous_single_resource_team_exits_usage(self, capsys):
         from laget_cli.cli import _resolve_team_slug
 
@@ -895,14 +938,13 @@ class TestAgentSafetyContracts:
             )
             with patch("laget_cli.cli.fetch_teams", side_effect=requests.ConnectionError()), \
                  patch("laget_cli.cli.fetch_children", side_effect=requests.ConnectionError()):
-                status = _get_status(
-                    session=MagicMock(),
-                    config={"LAGET_EMAIL": "new@example.com", "LAGET_PASSWORD": "new"},
-                )
+                with pytest.raises(requests.ConnectionError):
+                    _get_status(
+                        session=MagicMock(),
+                        config={"LAGET_EMAIL": "new@example.com", "LAGET_PASSWORD": "new"},
+                    )
 
         assert json.loads(state.read_text()) == {"child_teams": {}}
-        assert status["teams"] == []
-        assert status["children"] == []
         assert state.stat().st_mode & 0o777 == 0o600
 
     def test_config_and_state_files_are_private(self, tmp_path):

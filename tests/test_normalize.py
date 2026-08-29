@@ -8,6 +8,7 @@ from laget_cli.api.normalize import (
     _infer_notification_type,
     _normalize_datetime,
     _normalize_event_type,
+    _normalize_json_datetime,
     _normalize_time,
     _strip_html,
 )
@@ -112,6 +113,16 @@ class TestNormalizeDatetime:
         assert "Warning" in capsys.readouterr().err
 
 
+class TestNormalizeJsonDatetime:
+    def test_removes_fractional_seconds_and_keeps_timezone(self):
+        assert _normalize_json_datetime("2026-08-29T12:13:14.123Z") == "2026-08-29T12:13:14Z"
+        assert _normalize_json_datetime("2026-08-29T12:13:14.1+02:00") == "2026-08-29T12:13:14+02:00"
+
+    def test_accepts_second_resolution_and_none(self):
+        assert _normalize_json_datetime("2026-08-29T12:13:14") == "2026-08-29T12:13:14"
+        assert _normalize_json_datetime(None) is None
+
+
 class TestNormalizeTime:
     def test_extracts_time(self):
         assert _normalize_time("10:00") == "10:00"
@@ -199,6 +210,9 @@ class TestStripHtml:
 
     def test_none_returns_empty_string(self):
         assert _strip_html(None) == ""
+
+    def test_unescapes_html_entities(self):
+        assert _strip_html("Mål &amp; assist") == "Mål & assist"
 
 
 class TestInferNotificationType:

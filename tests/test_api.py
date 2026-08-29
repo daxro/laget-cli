@@ -1,194 +1,113 @@
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock
 
-from laget_cli.api.teams import _parse_teams, _parse_children, filter_teams_by_club, fetch_teams, fetch_children
+import pytest
+
+from laget_cli.api.teams import (
+    _slug_from_page_url,
+    fetch_children,
+    fetch_teams,
+    filter_teams_by_club,
+    sync_child_team_mapping,
+)
 from laget_cli.errors import ParseError
+from laget_cli.session import HTTP_TIMEOUT
 
 
-# HTML fixtures matching the real laget.se structure observed during reverse engineering
-
-TEAMS_HTML = '''
-<ul class="popoverList">
-    <li>
-        <div class="popoverList__itemInner padding--none">
-            <a class="popoverList__contentWrapper" href="https://www.laget.se/TeamAlpha-P2021">
-                <span class="popoverList__icon--angle"><i class="icon-angle-right"></i></span>
-                <div class="popoverList__image--emblem"></div>
-                <div class="popoverList__textWrapper">
-                    <p class="popoverList__name"><b>P2021</b></p>
-                    <small class="popoverList__club">Team Alpha FK</small>
-                </div>
-            </a>
-        </div>
-    </li>
-    <li>
-        <div class="popoverList__itemInner padding--none">
-            <a class="popoverList__contentWrapper" href="https://www.laget.se/TeamBeta-F2019">
-                <span class="popoverList__icon--angle"><i class="icon-angle-right"></i></span>
-                <div class="popoverList__image--emblem"></div>
-                <div class="popoverList__textWrapper">
-                    <p class="popoverList__name"><b>F2019</b></p>
-                    <small class="popoverList__club">Team Beta IK</small>
-                </div>
-            </a>
-        </div>
-    </li>
-    <li>
-        <div class="popoverList__itemInner padding--none">
-            <a class="popoverList__contentWrapper" href="https://www.laget.se/TeamAlpha-P2019Vast">
-                <span class="popoverList__icon--angle"><i class="icon-angle-right"></i></span>
-                <div class="popoverList__image--emblem"></div>
-                <div class="popoverList__textWrapper">
-                    <p class="popoverList__name"><b>P2019 V&#228;st</b></p>
-                    <small class="popoverList__club">Team Alpha FK</small>
-                </div>
-            </a>
-        </div>
-    </li>
-</ul>
-'''
-
-CHILDREN_HTML = '''
-<!DOCTYPE HTML>
-<html>
-<head><title>Mina uppgifter</title></head>
-<body>
-<div>
-    <ul>
-        <li>
-            <a href="javascript:ShowChildProfileSettings('1234567');">
-                <span><i class="user"></i></span><span>Alice Testsson</span>
-            </a>
-        </li>
-        <li>
-            <a href="javascript:ShowChildProfileSettings('7654321');">
-                <span><i class="user"></i></span><span>Bob Testsson</span>
-            </a>
-        </li>
-    </ul>
-</div>
-</body>
-</html>
-'''
-
-CHILDREN_HTML_SINGLE = '''
-<ul>
-    <li>
-        <a href="javascript:ShowChildProfileSettings('9999999');">
-            <span>Only Child</span>
-        </a>
-    </li>
-</ul>
-'''
-
-EMPTY_HTML = '<html><body>No data</body></html>'
+def _response(payload):
+    response = MagicMock()
+    response.json.return_value = payload
+    return response
 
 
-class TestParseTeams:
-    def test_parses_multiple_teams(self):
-        teams = _parse_teams(TEAMS_HTML)
-        assert len(teams) == 3
-        assert teams[0] == {"name": "P2021", "club": "Team Alpha FK", "team_slug": "TeamAlpha-P2021"}
-        assert teams[1] == {"name": "F2019", "club": "Team Beta IK", "team_slug": "TeamBeta-F2019"}
-        assert teams[2] == {"name": "P2019 Väst", "club": "Team Alpha FK", "team_slug": "TeamAlpha-P2019Vast"}
+def test_fetch_teams_joins_mobile_team_and_page_resources():
+    session = MagicMock(user_id="42")
+    session.get.side_effect = [
+        _response(
+            {
+                "teams": [
+                    {
+                        "id": 10,
+                        "displayName": "P2019",
+                        "parentSite": {"displayName": "Example FC"},
+                    },
+                    {"id": 11, "displayName": "Standalone"},
+                ]
+            }
+        ),
+        _response(
+            {
+                "pages": [
+                    {"id": 10, "url": "https://www.laget.se/ExampleFC-P2019"},
+                    {"id": 11, "url": "/Standalone/"},
+                ]
+            }
+        ),
+    ]
 
-    def test_empty_html_returns_empty_list(self):
-        teams = _parse_teams(EMPTY_HTML)
-        assert teams == []
+    teams = fetch_teams(session)
 
-    def test_raises_parse_error_on_broken_popover_list(self):
-        broken = '<ul class="popoverList"><li>broken content</li></ul>'
-        try:
-            _parse_teams(broken)
-            assert False, "Should have raised ParseError"
-        except ParseError as e:
-            assert "popoverList" in str(e)
-
-
-class TestParseChildren:
-    def test_parses_multiple_children(self):
-        children = _parse_children(CHILDREN_HTML)
-        assert len(children) == 2
-        assert children[0] == {"name": "Alice Testsson", "id": "1234567"}
-        assert children[1] == {"name": "Bob Testsson", "id": "7654321"}
-
-    def test_parses_single_child(self):
-        children = _parse_children(CHILDREN_HTML_SINGLE)
-        assert len(children) == 1
-        assert children[0] == {"name": "Only Child", "id": "9999999"}
-
-    def test_empty_html_returns_empty_list(self):
-        children = _parse_children(EMPTY_HTML)
-        assert children == []
-
-
-class TestFilterTeamsByClub:
-    def test_filters_by_club_name(self):
-        teams = [
-            {"name": "P2021", "club": "Team Alpha FK", "team_slug": "a"},
-            {"name": "F2019", "club": "Team Beta IK", "team_slug": "b"},
-            {"name": "P2019", "club": "Team Alpha FK", "team_slug": "c"},
-        ]
-        result = filter_teams_by_club(teams, "Team Alpha")
-        assert len(result) == 2
-        assert all(t["club"] == "Team Alpha FK" for t in result)
-
-    def test_case_insensitive(self):
-        teams = [{"name": "T1", "club": "Test Club", "team_slug": "a"}]
-        assert len(filter_teams_by_club(teams, "test club")) == 1
-        assert len(filter_teams_by_club(teams, "TEST CLUB")) == 1
-
-    def test_no_filter_returns_all(self):
-        teams = [{"name": "T1", "club": "A", "team_slug": "a"}, {"name": "T2", "club": "B", "team_slug": "b"}]
-        assert len(filter_teams_by_club(teams, None)) == 2
-        assert len(filter_teams_by_club(teams, "")) == 2
-
-    def test_no_match_returns_empty(self):
-        teams = [{"name": "T1", "club": "A", "team_slug": "a"}]
-        assert filter_teams_by_club(teams, "nonexistent") == []
+    assert teams == [
+        {
+            "name": "P2019",
+            "club": "Example FC",
+            "team_slug": "ExampleFC-P2019",
+            "_site_id": "10",
+            "_page_url": "https://www.laget.se/ExampleFC-P2019",
+        },
+        {
+            "name": "Standalone",
+            "club": "Standalone",
+            "team_slug": "Standalone",
+            "_site_id": "11",
+            "_page_url": "/Standalone/",
+        },
+    ]
+    assert "/v4/users/42/teams" in session.get.call_args_list[0].args[0]
+    assert "/v4/users/42/pages" in session.get.call_args_list[1].args[0]
+    for call in session.get.call_args_list:
+        assert call.kwargs["timeout"] == HTTP_TIMEOUT
 
 
-class TestFetchTeams:
-    def test_fetch_teams_calls_endpoint(self):
-        session = MagicMock()
-        resp = MagicMock()
-        resp.text = TEAMS_HTML
-        resp.raise_for_status = MagicMock()
-        session.get.return_value = resp
-
-        teams = fetch_teams(session)
-        assert len(teams) == 3
-        session.get.assert_called_once()
-        assert "/Common/UserMenu/Pages" in session.get.call_args[0][0]
+def test_fetch_teams_keeps_unjoined_team_with_no_slug():
+    session = MagicMock(user_id=7)
+    session.get.side_effect = [
+        _response({"teams": [{"id": 1, "displayName": "Team"}]}),
+        _response({"pages": []}),
+    ]
+    assert fetch_teams(session)[0]["team_slug"] is None
 
 
-class TestFetchChildren:
-    def test_fetch_children_calls_endpoint(self):
-        session = MagicMock()
-        resp = MagicMock()
-        resp.text = CHILDREN_HTML
-        resp.raise_for_status = MagicMock()
-        session.get.return_value = resp
-
-        children = fetch_children(session)
-        assert len(children) == 2
-        session.get.assert_called_once()
-        assert "/User/Children" in session.get.call_args[0][0]
+def test_fetch_teams_rejects_wrong_envelope():
+    session = MagicMock(user_id=7)
+    session.get.side_effect = [_response([]), _response({"pages": []})]
+    with pytest.raises(ParseError):
+        fetch_teams(session)
 
 
-class TestSyncChildTeamMapping:
-    @patch("laget_cli.api.teams.fetch_roster_member_ids")
-    def test_stops_after_all_children_are_mapped(self, fetch_roster):
-        from laget_cli.api.teams import sync_child_team_mapping
+@pytest.mark.parametrize(
+    ("url", "slug"),
+    [
+        ("https://www.laget.se/Club-Team?x=1", "Club-Team"),
+        ("/Club-Team/News", "Club-Team"),
+        (None, None),
+    ],
+)
+def test_slug_from_page_url(url, slug):
+    assert _slug_from_page_url(url) == slug
 
-        fetch_roster.return_value = {"1", "2"}
-        teams = [
-            {"team_slug": "first"},
-            {"team_slug": "second"},
-            {"team_slug": "third"},
-        ]
-        children = [{"id": "1"}, {"id": "2"}]
 
-        mapping = sync_child_team_mapping(MagicMock(), teams, children)
+def test_children_and_mapping_do_not_make_html_requests():
+    session = MagicMock()
+    assert fetch_children(session) == []
+    assert sync_child_team_mapping(session, [{"team_slug": "a"}], [{"id": "1"}]) == {}
+    session.get.assert_not_called()
 
-        assert mapping == {"1": "first", "2": "first"}
-        fetch_roster.assert_called_once_with(ANY, "first")
+
+def test_filter_teams_by_club_is_case_insensitive_and_null_safe():
+    teams = [
+        {"club": "Example FC"},
+        {"club": "Other"},
+        {"club": None},
+    ]
+    assert filter_teams_by_club(teams, "EXAMPLE") == [teams[0]]
+    assert filter_teams_by_club(teams, None) is teams

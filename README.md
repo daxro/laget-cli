@@ -1,6 +1,6 @@
 # laget-cli
 
-An unofficial command-line interface for [laget.se](https://www.laget.se). It uses undocumented web endpoints and may break when laget.se changes.
+An unofficial command-line interface for [laget.se](https://www.laget.se). It uses the undocumented JSON API used by the official Android app and may break when laget.se changes.
 
 `laget-cli` is designed for people, scripts, and any software agent that can run a CLI and consume JSON.
 
@@ -54,7 +54,9 @@ The legacy `EMAIL` and `PASSWORD` environment variables remain temporarily suppo
 - Prefer bounded reads: use date ranges, `--limit`, and `--fields`.
 - `calendar` and `notifications` team filters may match multiple teams.
 - `news` and `event` accept an exact slug or a unique substring. Ambiguous matches fail.
-- `rsvp` requires an exact team slug and changes remote state.
+- `feed` reads the mobile app's content feed. `notifications` remains an alias; it is not the website's legacy notification inbox.
+- The mobile API exposes only whether an account has children, not a child list. `status.children` is therefore empty.
+- `rsvp` requires an exact team slug and changes remote state. Use `--member` when an event targets more than one person.
 - `reset` deletes local credentials, session, and state.
 - `--debug` may expose sensitive HTTP details. Review debug output before sharing it.
 
@@ -62,19 +64,20 @@ The legacy `EMAIL` and `PASSWORD` environment variables remain temporarily suppo
 
 ```bash
 laget status --json -q
-laget notifications --since 2026-06-01 --limit 10 -q
-laget notifications --team P2019 --fields date,type,title -q
+laget feed --since 2026-06-01 --limit 10 -q
+laget feed --team P2019 --fields date,type,title -q
 laget calendar --until 2026-07-05 --limit 5 -q
 laget calendar --team P2019 --fields id,date,title -q
 laget news --team ExampleFC-P2019 67890 -q
 laget event --team ExampleFC-P2019 12345 -q
 laget rsvp --team ExampleFC-P2019 12345 yes -q
+laget rsvp --team ExampleFC-P2019 12345 yes --member 67890 -q
 laget reset -q
 ```
 
 Dates must be real ISO dates in `YYYY-MM-DD` format. Calendar ranges are limited to 24 months. For calendar, `--since all` means one year ago and `--until all` means one year ahead; using both gives the bounded two-year range.
 
-`--fields` rejects unknown or empty fields. It filters notification records, event/detail/status/reset objects, and calendar event objects while preserving each calendar team envelope.
+`--fields` rejects unknown or empty fields. It filters feed records, event/detail/status/reset objects, and calendar event objects while preserving each calendar team envelope. For `status --json`, selecting fields also avoids unrelated requests; use `--fields teams` for lightweight team discovery.
 
 Compact success output:
 
@@ -102,7 +105,7 @@ Error output:
 
 ## Local Files
 
-Run `laget status --json` to see the actual config and session paths for the current platform. Config, session, and state files are written atomically with `0600` permissions.
+Run `laget status --json` to see the actual config and session paths for the current platform. Config, session, and state files are written atomically with `0600` permissions. Existing web-cookie sessions are automatically replaced with a versioned API-token session after the next successful authentication.
 
 ## Uninstall
 

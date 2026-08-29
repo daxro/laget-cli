@@ -1,8 +1,9 @@
-"""Shared normalization functions for laget.se HTML parsing."""
+"""Shared normalization functions for laget.se resources."""
 
 import re
 import sys
 from datetime import datetime, timedelta
+from html import unescape
 
 _SWEDISH_MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
@@ -147,7 +148,28 @@ def _strip_html(raw):
     text = re.sub(r"</div>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return unescape(text).strip()
+
+
+def _normalize_json_datetime(raw):
+    """Normalize an API ISO timestamp to the CLI's second-resolution format.
+
+    Timezone information is retained when present; fractional seconds are
+    removed to keep output stable across endpoints.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
+        value,
+    )
+    if match:
+        timezone = match.group(3) or ""
+        return f"{match.group(1)}T{match.group(2)}{timezone}"
+    return _normalize_datetime(value)
 
 
 def _infer_notification_type(url):

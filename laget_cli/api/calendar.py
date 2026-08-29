@@ -1,36 +1,349 @@
-"""laget.se calendar API - fetch and parse events."""
+"""Calendar, event detail, and RSVP calls for laget.se's JSON API."""
 
-import re
-from datetime import date
-from html import unescape
-from html.parser import HTMLParser
-from urllib.parse import urljoin
+from __future__ import annotations
 
-from laget_cli.api.normalize import _normalize_event_type, _normalize_time, _strip_html
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
+
+from laget_cli.api.normalize import _normalize_event_type, _strip_html
 from laget_cli.errors import ParseError
-from laget_cli.session import AJAX_HEADERS, BASE_URL, HTTP_TIMEOUT
+from laget_cli.session import API_URL, HTTP_TIMEOUT
+
+
+API_BASE_URL = API_URL
+_PAGE_SIZE = 50
+_MAX_PAGES = 100
+_STOCKHOLM = ZoneInfo("Europe/Stockholm")
+_DETAIL_FIELDS = {"location", "assembly_time", "location_url", "notes", "rsvp"}
+
+
+def _response_json(response):
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ParseError("laget.se API returned invalid JSON") from exc
+
+
+def _epoch_to_local_iso(value):
+    """Return an offset-free Europe/Stockholm ISO timestamp."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            value = float(stripped)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(_STOCKHOLM).replace(tzinfo=None)
+            return parsed.isoformat(timespec="seconds")
+    if not isinstance(value, (int, float)):
+        return None
+    # The mobile API currently returns milliseconds, but tolerate seconds.
+    seconds = value / 1000 if abs(value) >= 100_000_000_000 else value
+    try:
+        local = datetime.fromtimestamp(seconds, tz=timezone.utc).astimezone(_STOCKHOLM)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return local.replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _time_from_value(value):
+    if isinstance(value, dict):
+        if not value.get("enabled"):
+            return None
+        value = value.get("date")
+    normalized = _epoch_to_local_iso(value)
+    if normalized:
+        return normalized[11:16]
+    if isinstance(value, str):
+        import re
+
+        match = re.search(r"\b(\d{1,2}:\d{2})\b", value)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _site(event):
+    value = event.get("site")
+    return value if isinstance(value, dict) else {}
+
+
+def _site_slug(event, fallback=None):
+    site = _site(event)
+    raw = site.get("url") or event.get("teamSlug") or fallback
+    if not isinstance(raw, str):
+        return fallback
+    path = urlparse(raw).path if "://" in raw else raw
+    slug = path.strip("/").split("/", 1)[0]
+    return slug or fallback
+
+
+def _site_id(event):
+    value = _site(event).get("id", event.get("siteId"))
+    return str(value) if value is not None else None
+
+
+def _event_id(event):
+    value = event.get("id", event.get("eventId"))
+    return str(value) if value is not None else None
+
+
+def _event_type(event):
+    raw = event.get("eventType", event.get("type"))
+    if isinstance(raw, str) and not raw.isdigit():
+        return _normalize_event_type(raw)
+    # Numeric event types are not documented; the title is the stable semantic
+    # source used by the previous CLI as well.
+    return _normalize_event_type(event.get("title"))
+
+
+def _location(event):
+    value = event.get("place", event.get("location"))
+    if isinstance(value, dict):
+        return value.get("name") or value.get("title") or value.get("address")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _location_url(event):
+    value = event.get("place", event.get("location"))
+    if isinstance(value, dict):
+        return value.get("url") or value.get("mapUrl") or value.get("locationUrl")
+    candidate = event.get("locationUrl") or event.get("mapUrl")
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _attending_response(value):
+    if value is True or value == 1 or str(value).lower() in {"1", "yes", "true"}:
+        return "yes"
+    if value is False or value == 2 or str(value).lower() in {"2", "no", "false"}:
+        return "no"
+    return "unanswered"
+
+
+def _concernee_states(event):
+    """Return public responses and private per-member RSVP state."""
+    raw_concernees = event.get("concernees")
+    if not isinstance(raw_concernees, list):
+        raw_concernees = []
+    responses = []
+    by_member = {}
+    for concernee in raw_concernees:
+        if not isinstance(concernee, dict) or concernee.get("id") is None:
+            continue
+        member_id = str(concernee["id"])
+        state = concernee.get("rsvp")
+        state = dict(state) if isinstance(state, dict) else {}
+        by_member[member_id] = state
+        responses.append({
+            "id": member_id,
+            "name": concernee.get("name") if isinstance(concernee.get("name"), str) else None,
+            "my_response": _attending_response(state.get("attending")),
+            "answer": state.get("answer") if isinstance(state.get("answer"), str) else None,
+            "reason": state.get("reason") if isinstance(state.get("reason"), str) else None,
+        })
+    return responses, by_member
+
+
+def _rsvp_state(event, session_user_id=None):
+    user_rsvp = event.get("userRsvp")
+    if not isinstance(user_rsvp, dict):
+        user_rsvp = None
+    responses, by_member = _concernee_states(event)
+    concernee_member_ids = set(by_member)
+    if user_rsvp is not None and session_user_id is not None:
+        by_member.setdefault(str(session_user_id), dict(user_rsvp))
+    enabled = bool(event.get("rsvp")) or user_rsvp is not None or bool(by_member)
+    if not enabled:
+        return None, None, responses, by_member
+
+    selected_member = None
+    if len(concernee_member_ids) == 1:
+        selected_member = next(iter(concernee_member_ids))
+    elif user_rsvp is not None and session_user_id is not None:
+        selected_member = str(session_user_id)
+    state = dict(by_member.get(selected_member, user_rsvp or {}))
+    response = _attending_response(state.get("attending"))
+    event_id = _event_id(event)
+    slug = _site_slug(event)
+    url = None
+    if event_id and selected_member and slug:
+        url = f"https://www.laget.se/{slug}/Rsvp/{event_id}/{selected_member}"
+    return {
+        "yes": None,
+        "no": None,
+        "unanswered": None,
+        "my_response": response,
+        "url": url,
+    }, state, responses, by_member
+
+
+def _normalise_event(event, team_slug=None, include_team=False, user_id=None):
+    if not isinstance(event, dict):
+        raise ParseError("laget.se API event must be an object")
+    event_id = _event_id(event)
+    if event_id is None:
+        raise ParseError("laget.se API event is missing id")
+    start = _epoch_to_local_iso(
+        event.get("dateStart", event.get("startDate", event.get("date")))
+    )
+    end = _epoch_to_local_iso(event.get("dateEnd", event.get("endDate")))
+    rsvp, private_rsvp, responses, rsvp_by_member = _rsvp_state(
+        event, session_user_id=user_id
+    )
+    notes = event.get("body", event.get("notes", event.get("description")))
+    if isinstance(notes, str):
+        notes = _strip_html(notes) or None
+    else:
+        notes = None
+    cancelled = bool(
+        event.get("cancelled", event.get("isCancelled", event.get("canceled", False)))
+    )
+    result = {
+        "id": event_id,
+        "type": _event_type(event),
+        "title": event.get("title") if isinstance(event.get("title"), str) else None,
+        "cancelled": cancelled,
+        "date": start,
+        "start_time": start[11:16] if start else None,
+        "end_time": end[11:16] if end else None,
+        "location": _location(event),
+        "assembly_time": _time_from_value(event.get("assembly")),
+        "location_url": _location_url(event),
+        "notes": notes,
+        "rsvp": rsvp,
+    }
+    if include_team:
+        result = {
+            "id": result["id"],
+            "team": None,
+            "team_slug": _site_slug(event, team_slug),
+            **{key: value for key, value in result.items() if key != "id"},
+            "responses": responses,
+        }
+    return result, {
+        "site_id": _site_id(event),
+        "user_rsvp": private_rsvp,
+        "rsvp_by_member": rsvp_by_member,
+        "eligible_member_ids": set(rsvp_by_member),
+        "concernee_member_ids": {response["id"] for response in responses},
+        "raw": event,
+    }
+
+
+def _event_cache(session):
+    cache = getattr(session, "_laget_event_state", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(session, "_laget_event_state", cache)
+        except (AttributeError, TypeError):
+            pass
+    return cache
+
+
+def _cache_event(session, event_id, state):
+    _event_cache(session)[str(event_id)] = state
+
+
+def _session_user_id(session):
+    value = getattr(session, "user_id", None)
+    if value is None:
+        raise ParseError("Authenticated session is missing user_id")
+    return str(value)
+
+
+def _team_site_id(session, team_slug, explicit=None):
+    if explicit is not None:
+        return str(explicit)
+    mapping = getattr(session, "team_site_ids", None)
+    value = mapping.get(team_slug) if isinstance(mapping, dict) else None
+    if isinstance(value, dict):
+        value = value.get("site_id", value.get("id"))
+    if value is None:
+        raise ParseError(f"No site id is known for team '{team_slug}'")
+    return str(value)
+
+
+def _events_from_payload(payload):
+    if not isinstance(payload, dict):
+        raise ParseError("laget.se API event list must be an object")
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise ParseError("laget.se API event list is missing events")
+    return events
+
+
+def _fetch_feed(session, user_id, feed, start, end, site_id):
+    cache = getattr(session, "_laget_event_feed_pages", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            session._laget_event_feed_pages = cache
+        except (AttributeError, TypeError):
+            pass
+    cache_key = (str(user_id), feed, start.isoformat(), end.isoformat())
+    if cache_key in cache:
+        return [raw for raw in cache[cache_key] if _site_id(raw) == site_id]
+
+    collected = []
+    for page_index in range(_MAX_PAGES):
+        response = session.get(
+            f"{API_BASE_URL}/v4/users/{user_id}/events/{feed}",
+            params={"pageIndex": page_index, "pageSize": _PAGE_SIZE},
+            timeout=HTTP_TIMEOUT,
+        )
+        page = _events_from_payload(_response_json(response))
+        if not page:
+            break
+
+        page_dates = []
+        for raw in page:
+            if not isinstance(raw, dict):
+                raise ParseError("laget.se API event list contains a non-object")
+            when = _epoch_to_local_iso(raw.get("dateStart"))
+            if when:
+                page_dates.append(when[:10])
+            if not when:
+                continue
+            if start.isoformat() <= when[:10] <= end.isoformat():
+                collected.append(raw)
+
+        if len(page) < _PAGE_SIZE:
+            break
+        # The app feeds are ordered away from today. Stop only after every
+        # dated record in a full page has crossed the requested boundary.
+        if page_dates and feed == "upcoming" and min(page_dates) > end.isoformat():
+            break
+        if page_dates and feed == "past" and max(page_dates) < start.isoformat():
+            break
+    else:
+        raise ParseError("laget.se API event pagination exceeded safety limit")
+    cache[cache_key] = collected
+    return [raw for raw in collected if _site_id(raw) == site_id]
 
 
 def fetch_calendar(session, team_slug, year, month):
-    """Fetch calendar events for a single month.
-
-    GET /{team_slug}/Event/FilterEvents?year={year}&month={month}&siteType=Team&types=2&types=4&types=6&types=7
-
-    Returns a list of event dicts for that month.
-    """
-    resp = session.get(
-        f"{BASE_URL}/{team_slug}/Event/FilterEvents",
-        params={
-            "year": year,
-            "month": month,
-            "siteType": "Team",
-            "types": [2, 4, 6, 7],
-        },
-        headers=AJAX_HEADERS,
-        timeout=HTTP_TIMEOUT,
+    """Compatibility wrapper for one calendar month."""
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    end = date.fromordinal(next_month.toordinal() - 1)
+    return fetch_calendar_range(
+        session,
+        team_slug,
+        date(year, month, 1).isoformat(),
+        end.isoformat(),
     )
-    resp.raise_for_status()
-    return _parse_calendar_month(resp.text, year, month)
 
 
 def fetch_calendar_range(
@@ -41,18 +354,7 @@ def fetch_calendar_range(
     limit=None,
     detail_fields=None,
 ):
-    """Fetch calendar events across a date range, spanning multiple months if needed.
-
-    Args:
-        session: authenticated requests.Session
-        team_slug: team URL slug
-        start_date: ISO date string "YYYY-MM-DD" or None
-        end_date: ISO date string "YYYY-MM-DD" or None
-        limit: maximum number of events to return
-        detail_fields: detail fields to fetch, all detail fields when None
-
-    Returns a deduplicated, sorted list of event dicts.
-    """
+    """Fetch, filter, deduplicate and normalize a team's API events."""
     today = date.today()
     try:
         previous_year = today.replace(year=today.year - 1)
@@ -66,508 +368,140 @@ def fetch_calendar_range(
     end = date.fromisoformat(end_date) if end_date else default_end
     if start > end:
         raise ValueError("calendar start date must be on or before end date")
+    month_count = (end.year - start.year) * 12 + end.month - start.month + 1
+    if month_count > 24:
+        raise ValueError("calendar date range may span at most 24 months")
 
-    # Build list of (year, month) pairs to fetch
-    months = []
-    current_year = start.year
-    current_month = start.month
-    while (current_year, current_month) <= (end.year, end.month):
-        months.append((current_year, current_month))
-        if len(months) > 24:
-            raise ValueError("calendar date range may span at most 24 months")
-        current_month += 1
-        if current_month > 12:
-            current_month = 1
-            current_year += 1
+    user_id = _session_user_id(session)
+    site_id = _team_site_id(session, team_slug)
+    feeds = []
+    if start <= today:
+        feeds.append("past")
+    if end >= today:
+        feeds.append("upcoming")
 
-    all_events = []
-    seen_ids = set()
-    for year, month in months:
-        events = fetch_calendar(session, team_slug, year, month)
-        for event in events:
-            event_date = event["date"][:10]
-            if event_date < start.isoformat() or event_date > end.isoformat():
-                continue
-            if event["id"] not in seen_ids:
-                seen_ids.add(event["id"])
-                all_events.append(event)
-                if limit is not None and len(all_events) >= limit:
-                    break
-        if limit is not None and len(all_events) >= limit:
-            break
+    raw_events = []
+    for feed in feeds:
+        raw_events.extend(_fetch_feed(session, user_id, feed, start, end, site_id))
 
-    all_events.sort(key=lambda e: e["date"])
-    requested_detail_fields = (
-        {"location", "assembly_time", "location_url", "notes", "rsvp"}
-        if detail_fields is None
-        else set(detail_fields)
-    )
-    for event in all_events:
-        if requested_detail_fields:
-            event.update(
-                _fetch_calendar_event_fields(
-                    session,
-                    team_slug,
-                    event["id"],
-                    requested_detail_fields,
-                )
-            )
-    return all_events
+    deduplicated = {}
+    for raw in raw_events:
+        event_id = _event_id(raw)
+        if event_id is not None:
+            deduplicated[event_id] = raw
+    normalized = []
+    for raw in deduplicated.values():
+        item, state = _normalise_event(raw, team_slug=team_slug, user_id=user_id)
+        _cache_event(session, item["id"], state)
+        normalized.append(item)
+    normalized.sort(key=lambda item: item["date"] or "")
+    if limit is not None:
+        normalized = normalized[:limit]
+
+    # All detail fields already exist in the JSON list. Retain the argument to
+    # preserve the public function contract and selective CLI behavior.
+    if detail_fields is not None:
+        requested = set(detail_fields) & _DETAIL_FIELDS
+        for item in normalized:
+            for field in _DETAIL_FIELDS - requested:
+                # Keep the stable schema; only requested fields carry values.
+                item[field] = None
+    return normalized
 
 
-def _extract_outer_li_content(html, start_pos):
-    """Return the content inside the <li> starting at start_pos, balancing nested <li> tags.
-
-    Returns (content, end_pos) where content is the HTML between the outer opening
-    and closing <li> tags (exclusive), and end_pos is the position after </li>.
-    Returns (None, start_pos) if parsing fails.
-    """
-    # Find the end of the opening tag
-    open_end = html.find(">", start_pos)
-    if open_end == -1:
-        return None, start_pos
-    pos = open_end + 1
-    depth = 1
-
-    while pos < len(html) and depth > 0:
-        next_open = html.find("<li", pos)
-        next_close = html.find("</li>", pos)
-        if next_close == -1:
-            break
-        if next_open != -1 and next_open < next_close:
-            depth += 1
-            pos = next_open + 3
-        else:
-            depth -= 1
-            if depth == 0:
-                return html[open_end + 1:next_close], next_close + 5
-            pos = next_close + 5
-
-    return None, start_pos
-
-
-def _parse_calendar_month(html, year, month):
-    """Parse the ul.fullCalendar HTML fragment for a single month.
-
-    Returns a list of event dicts.
-    """
-    events = []
-
-    # Find all day container opening tags: <li class="fullCalendar__day..." data-day="N">
-    for day_tag_match in re.finditer(
-        r'<li\b[^>]*class="fullCalendar__day[^"]*"[^>]*data-day="(\d+)"[^>]*>',
-        html,
-    ):
-        day = int(day_tag_match.group(1))
-        tag_start = day_tag_match.start()
-
-        day_html, _ = _extract_outer_li_content(html, tag_start)
-        if not day_html:
-            continue
-
-        # Find event items within this day
-        for item_tag_match in re.finditer(
-            r'<li\b[^>]*class="fullCalendar__item"[^>]*id="js-event-\d+-(\d+)"[^>]*>',
-            day_html,
-        ):
-            event_id = item_tag_match.group(1)
-            item_start = item_tag_match.start()
-            item_html, _ = _extract_outer_li_content(day_html, item_start)
-            if not item_html:
-                continue
-
-            # Skip ad slots
-            if re.search(r'class="event_ad-|div-gpt-', item_html):
-                continue
-
-            event = _parse_event_item(item_html, event_id, year, month, day)
-            if event:
-                events.append(event)
-
-    return events
-
-
-def _parse_event_item(html, event_id, year, month, day):
-    """Parse a single fullCalendar__item li into an event dict."""
-    # Start time: first <span class="fullCalendar__time">
-    start_time = None
-    m = re.search(r'<span class="fullCalendar__time">(\d{1,2}:\d{2})</span>', html)
-    if m:
-        start_time = m.group(1)
-
-    # End time: <span class="fullCalendar__time float--left"> with arrow icon and <br>
-    end_time = None
-    m = re.search(
-        r'<span class="fullCalendar__time float--left">\s*<i[^>]*></i><br>(\d{1,2}:\d{2})',
-        html,
-    )
-    if m:
-        end_time = m.group(1)
-
-    # Event title: text after icon inside <p class="fullCalendar__text">
-    title = None
-    m = re.search(
-        r'<p class="fullCalendar__text">\s*(?:<i[^>]*></i>)?\s*(.*?)\s*</p>',
-        html,
-        re.DOTALL,
-    )
-    if m:
-        raw_title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-        title = unescape(raw_title) if raw_title else None
-
-    event_type = _normalize_event_type(title)
-
-    # Build ISO datetime
-    if start_time:
-        date_str = f"{year:04d}-{month:02d}-{day:02d}T{start_time}:00"
-    else:
-        date_str = f"{year:04d}-{month:02d}-{day:02d}T00:00:00"
-
-    return {
-        "id": event_id,
-        "type": event_type,
-        "title": title,
-        "cancelled": False,
-        "date": date_str,
-        "start_time": start_time,
-        "end_time": end_time,
-        "location": None,
-        "assembly_time": None,
-        "location_url": None,
-        "notes": None,
-        "rsvp": None,
-    }
-
-
-def _fetch_event_detail_html(session, team_slug, event_id):
-    """Fetch the raw event detail fragment for a single event."""
-    resp = session.get(
-        f"{BASE_URL}/{team_slug}/Event/Single",
-        params={"eventId": event_id},
-        headers=AJAX_HEADERS,
+def fetch_event_detail(session, team_slug, event_id, site_id=None):
+    """Fetch and normalize an event detail object from the JSON API."""
+    resolved_site_id = _team_site_id(session, team_slug, explicit=site_id)
+    response = session.get(
+        f"{API_BASE_URL}/v4/events/{event_id}",
+        params={"siteId": resolved_site_id},
         timeout=HTTP_TIMEOUT,
     )
-    resp.raise_for_status()
-    return resp.text
-
-
-def _fetch_calendar_event_fields(session, team_slug, event_id, fields):
-    """Fetch and parse only the requested calendar detail fields."""
-    html = _fetch_event_detail_html(session, team_slug, event_id)
-    parsers = {
-        "location": _parse_location,
-        "assembly_time": _parse_assembly_time,
-        "location_url": _parse_maps_url,
-        "notes": _parse_notes,
-        "rsvp": _parse_rsvp,
-    }
-    return {field: parsers[field](html) for field in fields}
-
-
-def fetch_event_detail(session, team_slug, event_id):
-    """Fetch the event detail fragment for a single event.
-
-    GET /{team_slug}/Event/Single?eventId={event_id}
-
-    Returns a parsed event detail dict.
-    """
-    html = _fetch_event_detail_html(session, team_slug, event_id)
-    return _parse_event_detail(html, event_id, team_slug)
-
-
-def _parse_event_detail(html, event_id, team_slug):
-    """Parse the bare HTML fragment returned by Event/Single.
-
-    Returns an event detail dict with location, assembly_time, notes, rsvp,
-    and null for fields only available in the list view (type, title, date, etc.).
-    """
-    location = _parse_location(html)
-    location_url = _parse_maps_url(html)
-    assembly_time = _parse_assembly_time(html)
-    notes = _parse_notes(html)
-    rsvp = _parse_rsvp(html)
-
-    return {
-        "id": str(event_id),
-        "team": None,
-        "team_slug": team_slug,
-        "type": None,
-        "title": None,
-        "cancelled": False,
-        "date": None,
-        "start_time": None,
-        "end_time": None,
-        "assembly_time": assembly_time,
-        "location": location,
-        "location_url": location_url,
-        "notes": notes,
-        "rsvp": rsvp,
-        "responses": [],
-    }
-
-
-def _parse_location(html):
-    """Extract location name from the map marker icon text node."""
-    m = re.search(
-        r'<i class="fullCalendar__icon--place icon-map-marker"></i>\s*(.*?)(?:\s*</div>|\s*<a\b)',
-        html,
-        re.DOTALL,
+    payload = _response_json(response)
+    if not isinstance(payload, dict) or not isinstance(payload.get("event"), dict):
+        raise ParseError("laget.se API event detail is missing event")
+    detail, state = _normalise_event(
+        payload["event"],
+        team_slug=team_slug,
+        include_team=True,
+        user_id=_session_user_id(session),
     )
-    if m:
-        raw = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-        return unescape(raw) if raw else None
-    return None
+    state["site_id"] = state.get("site_id") or resolved_site_id
+    _cache_event(session, event_id, state)
+    return detail
 
 
-def _parse_maps_url(html):
-    """Extract Google Maps URL from an <a href> or inline text (Övrig platsinfo)."""
-    # Check for <a href="...google.com/maps/search/...">
-    m = re.search(r'href="(https://www\.google\.com/maps/search/[^"]*)"', html)
-    if m:
-        return m.group(1)
-
-    # Check inline URL in Övrig platsinfo text
-    m = re.search(
-        r'Övrig platsinfo:\s*</span>\s*([\s\S]*?)</div>',
-        html,
-    )
-    if m:
-        inline = re.search(r'(https://www\.google\.com/maps/search/\S+)', m.group(1))
-        if inline:
-            return inline.group(1)
-
-    return None
-
-
-def _parse_assembly_time(html):
-    """Extract assembly time from Samlingstid label."""
-    m = re.search(r'Samlingstid:\s*</span>\s*(\d{1,2}:\d{2})', html)
-    if m:
-        return _normalize_time(m.group(1))
-    return None
-
-
-def _parse_notes(html):
-    """Extract notes from Anteckning label."""
-    m = re.search(r'Anteckning:\s*</span>([\s\S]*?)</div>', html)
-    if m:
-        raw = m.group(1).strip()
-        cleaned = _strip_html(raw)
-        return cleaned if cleaned else None
-    return None
-
-
-def _parse_rsvp(html):
-    """Extract RSVP status from Anmälan label.
-
-    Returns a dict with my_response or None if no RSVP section found.
-    """
-    if "Anmälan:" not in html:
-        return None
-
-    matches = re.findall(
-        r'<a\b[^>]*href="([^"]*/Rsvp/[^"]*)"[^>]*>\s*(.*?)\s*</a>',
-        html,
-        re.DOTALL,
-    )
-    if not matches:
-        return None
-    if len(matches) > 1:
-        raise ParseError("Found multiple RSVP links in event detail")
-
-    href, link_html = matches[0]
-    rsvp_text = re.sub(r"<[^>]+>", "", link_html).strip()
-
-    my_response = "unanswered"
-    if re.search(r'har svarat kommer inte', rsvp_text, re.IGNORECASE):
-        my_response = "no"
-    elif re.search(r'har svarat kommer', rsvp_text, re.IGNORECASE):
-        my_response = "yes"
-    elif re.search(r'har ej svarat', rsvp_text, re.IGNORECASE):
-        my_response = "unanswered"
-
-    return {
-        "yes": None,
-        "no": None,
-        "unanswered": None,
-        "my_response": my_response,
-        "url": urljoin(BASE_URL, unescape(href)),
-    }
-
-
-class _RsvpFormParser(HTMLParser):
-    """Parse the user-specific RSVP form without touching unrelated page forms."""
-
-    def __init__(self):
-        super().__init__()
-        self.forms = []
-        self._current = None
-        self._in_textarea = False
-        self._textarea_name = None
-        self._textarea_text = []
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "form" and attrs.get("id") == "js-rsvp-form":
-            self._current = {
-                "action": attrs.get("action"),
-                "fields": {},
-                "textareas": [],
-            }
-            return
-
-        if self._current is None:
-            return
-
-        if tag == "input":
-            name = attrs.get("name")
-            if name:
-                self._current["fields"][name] = attrs.get("value", "")
-        elif tag == "textarea":
-            self._in_textarea = True
-            self._textarea_name = attrs.get("name")
-            self._textarea_text = []
-
-    def handle_data(self, data):
-        if self._in_textarea:
-            self._textarea_text.append(data)
-
-    def handle_endtag(self, tag):
-        if self._current is None:
-            return
-
-        if tag == "textarea":
-            if self._textarea_name:
-                text = "".join(self._textarea_text)
-                self._current["fields"][self._textarea_name] = unescape(text)
-                self._current["textareas"].append(self._textarea_name)
-            self._in_textarea = False
-            self._textarea_name = None
-            self._textarea_text = []
-        elif tag == "form":
-            self.forms.append(self._current)
-            self._current = None
-
-
-class _RsvpInviteParser(HTMLParser):
-    """Find RSVP modal links embedded in the full RSVP page."""
-
-    def __init__(self):
-        super().__init__()
-        self.invites = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag != "a":
-            return
-        attrs = dict(attrs)
-        classes = attrs.get("class", "").split()
-        if "js-rsvp-invites" not in classes:
-            return
-        href = attrs.get("href")
-        event_id = attrs.get("data-eventid")
-        user_id = attrs.get("data-eventuserid")
-        if href and event_id and user_id:
-            self.invites.append({
-                "href": unescape(href),
-                "event_id": event_id,
-                "user_id": user_id,
-            })
-
-
-def _parse_rsvp_form(html, expected_event_id=None):
-    """Return the scoped RSVP form action and named fields."""
-    parser = _RsvpFormParser()
-    parser.feed(html)
-
-    if len(parser.forms) != 1:
-        raise ParseError(f"Expected one RSVP form, found {len(parser.forms)}")
-
-    form = parser.forms[0]
-    action = form["action"]
-    if not action:
-        raise ParseError("RSVP form is missing action")
-
-    fields = form["fields"]
-    required = {"EventId", "EventUserId", "WillAttend"}
-    missing = sorted(required - set(fields))
-    if missing:
-        raise ParseError(f"RSVP form is missing required fields: {', '.join(missing)}")
-
-    if expected_event_id is not None and fields["EventId"] != str(expected_event_id):
-        raise ParseError(f"RSVP form EventId {fields['EventId']} does not match {expected_event_id}")
-
-    return {
-        "action": action,
-        "fields": fields,
-        "textareas": form["textareas"],
-    }
-
-
-def _extract_rsvp_url_ids(rsvp_url):
-    m = re.search(r"/Rsvp/([^/?#]+)/([^/?#]+)", rsvp_url)
-    if not m:
+def _ids_from_rsvp_url(rsvp_url):
+    if not isinstance(rsvp_url, str):
         return None, None
-    return m.group(1), m.group(2)
+    parts = urlparse(rsvp_url).path.strip("/").split("/")
+    try:
+        index = next(i for i, part in enumerate(parts) if part.casefold() == "rsvp")
+    except StopIteration:
+        return None, None
+    event_id = parts[index + 1] if len(parts) > index + 1 else None
+    user_id = parts[index + 2] if len(parts) > index + 2 else None
+    return event_id, user_id
 
 
-def _find_rsvp_modal_url(html, rsvp_url, expected_event_id=None):
-    url_event_id, url_user_id = _extract_rsvp_url_ids(rsvp_url)
-    event_id = str(expected_event_id) if expected_event_id is not None else url_event_id
-    if not event_id or not url_user_id:
-        raise ParseError("Could not identify RSVP event/user from URL")
-
-    parser = _RsvpInviteParser()
-    parser.feed(html)
-    matches = [
-        invite for invite in parser.invites
-        if invite["event_id"] == event_id and invite["user_id"] == url_user_id
-    ]
-    if len(matches) != 1:
-        raise ParseError(f"Expected one matching RSVP modal link, found {len(matches)}")
-    return urljoin(rsvp_url, matches[0]["href"])
+def _json_id(value):
+    """Use the API's numeric ID type when a cached ID contains only digits."""
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
 
 
-def submit_rsvp(session, rsvp_url, response, comment=None, event_id=None):
-    """Submit an RSVP response using the exact user-specific RSVP form URL."""
+def submit_rsvp(
+    session,
+    rsvp_url,
+    response,
+    comment=None,
+    event_id=None,
+    member_id=None,
+):
+    """Submit a yes/no RSVP using cached current values from event detail."""
     if response not in {"yes", "no"}:
         raise ValueError("response must be 'yes' or 'no'")
-
-    resp = session.get(
-        rsvp_url,
-        headers=AJAX_HEADERS,
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
-
-    try:
-        form = _parse_rsvp_form(resp.text, expected_event_id=event_id)
-        form_url = rsvp_url
-    except ParseError as e:
-        if "found 0" not in str(e):
-            raise
-        form_url = _find_rsvp_modal_url(resp.text, rsvp_url, expected_event_id=event_id)
-        resp = session.get(
-            form_url,
-            headers=AJAX_HEADERS,
-            timeout=HTTP_TIMEOUT,
-        )
-        resp.raise_for_status()
-        form = _parse_rsvp_form(resp.text, expected_event_id=event_id)
-
-    data = dict(form["fields"])
-    data["WillAttend"] = "True" if response == "yes" else "False"
-
+    url_event_id, _ = _ids_from_rsvp_url(rsvp_url)
+    resolved_event_id = str(event_id or url_event_id or "")
+    if not resolved_event_id:
+        raise ParseError("Could not identify RSVP event")
+    authenticated_user_id = _session_user_id(session)
+    state = _event_cache(session).get(resolved_event_id, {})
+    site_id = state.get("site_id")
+    if site_id is None:
+        raise ParseError("Could not identify RSVP site")
+    eligible = {str(value) for value in state.get("eligible_member_ids", set())}
+    concernees = {str(value) for value in state.get("concernee_member_ids", set())}
+    if member_id is not None:
+        resolved_member_id = str(member_id)
+        if resolved_member_id not in eligible:
+            raise ParseError(f"Member {resolved_member_id} is not eligible for this RSVP")
+    elif len(concernees) == 1:
+        resolved_member_id = next(iter(concernees))
+    elif authenticated_user_id in eligible:
+        resolved_member_id = authenticated_user_id
+    else:
+        raise ParseError("RSVP has multiple eligible members; member_id is required")
+    rsvp_by_member = state.get("rsvp_by_member")
+    rsvp_by_member = rsvp_by_member if isinstance(rsvp_by_member, dict) else {}
+    current = rsvp_by_member.get(resolved_member_id)
+    current = current if isinstance(current, dict) else {}
+    payload = {
+        "siteId": _json_id(site_id),
+        "attending": 1 if response == "yes" else 2,
+        "car": current.get("numCarSeats", current.get("car", 0)),
+        "assembly": current.get("attendingAssembly", current.get("assembly", False)),
+        "answer": current.get("answer") or "",
+        "reason": current.get("reason") or "",
+    }
     if comment is not None:
-        if not form["textareas"]:
-            raise ParseError("RSVP form does not support comments")
-        data[form["textareas"][0]] = comment
-
-    action_url = urljoin(form_url, form["action"])
-    post_resp = session.post(
-        action_url,
-        data=data,
-        headers=AJAX_HEADERS,
+        payload["answer" if response == "yes" else "reason"] = comment
+    result = session.put(
+        f"{API_BASE_URL}/v1/events/{resolved_event_id}/rsvp/{resolved_member_id}",
+        json=payload,
         timeout=HTTP_TIMEOUT,
     )
-    post_resp.raise_for_status()
-    return post_resp
+    result.raise_for_status()
+    result.laget_member_id = resolved_member_id
+    return result
